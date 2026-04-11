@@ -42,7 +42,6 @@ EXPLOITATION_ARTIFACTS_RELATIVE_DIR = f"{ARTIFACTS_DIR_NAME}/{EXPLOITATION_REPOR
 RESULT_FLAG_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/flag.txt"
 RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
-RESULT_CLAUDE_OUTPUT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/claude_output.txt"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 MAX_PARALLEL_EXPLOITATION = 2
 MAX_TOTAL_EXPLOITATION_SUBAGENTS = 4
@@ -51,6 +50,7 @@ MAX_TERMINAL_READ_CALLS = 40
 MAX_INLINE_TOOL_OUTPUT_BYTES = 4096
 MAX_INLINE_TOOL_OUTPUT_LINES = 20
 GRACEFUL_CLAUDE_INTERRUPT_SECONDS = 10
+FLAG_PATTERN = re.compile(r"flag\{[^\r\n]+\}")
 
 REQUIRED_CHALLENGE_ENV_KEYS = ["CHALLENGE_ENTRYPOINT"]
 OPTIONAL_CHALLENGE_ENV_KEYS = [
@@ -446,6 +446,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
                 "- 只有 exploitation 带回完整、可复核、来源明确的候选 `flag{...}` 后，你才可以调用 `mcp__platform__submit_flag`。",
                 "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；如果平台还有剩余 flag，继续当前题目，不要提前收工。",
                 "- `view_hint` 只允许在你明确判定当前题目已经阻塞时调用。",
+                "- 如果 `submit_flag` 返回错误，不要再次提交同一个 flag；把它视为已拒绝候选，回到证据驱动分析，只在存在其它高价值向量或一个明确缺失事实时继续推进。",
             ]
         )
 
@@ -657,9 +658,7 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False) -> str:
         tools += ",mcp__platform__submit_flag,mcp__platform__view_hint"
         platform_tools = " mcp__platform__submit_flag mcp__platform__view_hint"
 
-    output_path = shlex.quote(f"/home/kali/workspace/{RESULT_CLAUDE_OUTPUT_RELATIVE_PATH}")
     return (
-        "set -o pipefail; "
         "claude --verbose "
         "--mcp-config /home/kali/.claude/mcp.json "
         "--strict-mcp-config "
@@ -671,7 +670,7 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False) -> str:
         'mcp__sandbox__terminal_write mcp__sandbox__terminal_interrupt mcp__sandbox__terminal_close '
         f'mcp__sandbox__list_agent_runtimes mcp__sandbox__cleanup_agent_runtime{platform_tools}" '
         '--disallowedTools "Bash Write Edit MultiEdit WebFetch WebSearch NotebookRead NotebookEdit LS" '
-        f'-p "$(cat)" 2>&1 | tee {output_path}'
+        '-p "$(cat)"'
     )
 
 
@@ -723,9 +722,138 @@ def read_flag_result(task_dir: Path) -> str | None:
         content = flag_path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    if re.fullmatch(r"flag\{[^\r\n]+\}", content):
+    if FLAG_PATTERN.fullmatch(content):
         return content
     return None
+
+
+def iter_json_strings(value: object) -> list[str]:
+    items: list[str] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, str):
+            items.append(node)
+        elif isinstance(node, dict):
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return items
+
+
+def collect_json_keyed_strings(value: object, *, key_names: set[str]) -> list[str]:
+    items: list[str] = []
+
+    def visit(node: object) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                lowered = str(key).lower()
+                if lowered in key_names and isinstance(child, str):
+                    items.append(child)
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return items
+
+
+def extract_fallback_flag_from_observation(task_dir: Path) -> dict[str, object] | None:
+    report_path = task_dir / OBSERVATION_REPORT_RELATIVE_PATH
+    if not report_path.is_file():
+        return None
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    direct_flag_values = collect_json_keyed_strings(report, key_names={"flag"})
+    candidate_flags = sorted({match.group(0) for value in direct_flag_values for match in FLAG_PATTERN.finditer(value)})
+    if not candidate_flags:
+        candidate_flags = sorted(
+            {
+                match.group(0)
+                for value in iter_json_strings(report)
+                for match in FLAG_PATTERN.finditer(value)
+            }
+        )
+    if len(candidate_flags) != 1:
+        return None
+
+    evidence_candidates = collect_json_keyed_strings(report, key_names={"path", "evidence_path", "artifact", "artifacts"})
+    evidence_paths: list[str] = []
+    for item in evidence_candidates:
+        if item.startswith("/home/kali/workspace/") or item.startswith(".artifacts/"):
+            evidence_paths.append(item)
+    evidence_paths = list(dict.fromkeys(evidence_paths))
+    if not evidence_paths:
+        return None
+
+    vulnerability = ""
+    hypotheses = report.get("hypotheses")
+    if isinstance(hypotheses, list):
+        for item in hypotheses:
+            if isinstance(item, dict):
+                vulnerability = str(item.get("type") or item.get("family") or item.get("description") or "").strip()
+                if vulnerability:
+                    break
+
+    target = str(report.get("target") or "").strip()
+    return {
+        "flag": candidate_flags[0],
+        "report_path": str(report_path),
+        "evidence_paths": evidence_paths[:5],
+        "vulnerability": vulnerability,
+        "target": target,
+    }
+
+
+def auto_finalize_from_observation(task_dir: Path, challenge: dict[str, object]) -> str | None:
+    if challenge.get("challenge_mcp_enabled"):
+        return None
+    fallback = extract_fallback_flag_from_observation(task_dir)
+    if not fallback:
+        return None
+
+    results_dir = task_dir / RESULTS_DIR_NAME
+    results_dir.mkdir(parents=True, exist_ok=True)
+    flag_value = str(fallback["flag"])
+    evidence_paths = [str(item) for item in fallback["evidence_paths"]]
+    vulnerability = str(fallback.get("vulnerability") or "Observation-derived finding").strip()
+    target = str(fallback.get("target") or challenge.get("target_host") or "").strip()
+
+    (results_dir / "flag.txt").write_text(f"{flag_value}\n", encoding="utf-8")
+
+    evidence_lines = "\n".join(f"- `{path}`" for path in evidence_paths) or "- 未记录"
+    report_text = f"""# Auto Finalization Report
+
+## Summary
+- Challenge: `{challenge["challenge_code"]}`
+- Title: {challenge["challenge_title"]}
+- Target: {target or "未提供"}
+- Reason: Claude task ended before finalization completed, but observation report already contained one unique flag candidate with evidence.
+
+## Flag
+```
+{flag_value}
+```
+
+## Source
+- Observation report: `{fallback["report_path"]}`
+- Vulnerability / finding: {vulnerability}
+
+## Evidence
+{evidence_lines}
+
+## Status
+SUCCESS (launcher fallback finalization from observation evidence)
+"""
+    (results_dir / "final_report.md").write_text(report_text.strip() + "\n", encoding="utf-8")
+    return flag_value
 
 
 def has_complete_final_results(task_dir: Path) -> tuple[bool, str | None]:
@@ -785,6 +913,19 @@ def main() -> int:
             challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
         )
         completed_with_results, final_flag = has_complete_final_results(task_dir)
+        if exit_code != 0 and not completed_with_results:
+            fallback_flag = auto_finalize_from_observation(task_dir, challenge)
+            if fallback_flag:
+                completed_with_results, final_flag = has_complete_final_results(task_dir)
+                if completed_with_results:
+                    if timed_out:
+                        print(
+                            f"[+] Claude task timed out before finalization, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
+                        )
+                    else:
+                        print(
+                            f"[+] Claude task exited with code {exit_code}, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
+                        )
         if exit_code != 0 and completed_with_results:
             if timed_out:
                 print(

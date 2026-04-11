@@ -135,8 +135,7 @@ workspace/0411-120000-demo/
 ├── .results/
 │   ├── flag.txt
 │   ├── final_report.md
-│   ├── blocker_report.md
-│   └── claude_output.txt
+│   └── blocker_report.md
 ├── runtime_v2/
 ├── .claude/
 └── token_usage.txt
@@ -155,7 +154,7 @@ workspace/0411-120000-demo/
 
 - `.results/` 主要放规范结果产物，不要求每次都必须有 `final_report.md` 或 `blocker_report.md`
 - 若 agent 明确完成最终落盘，会写入 `flag.txt`、`final_report.md` 或 `blocker_report.md`
-- 无论是否生成强制总结，`run_task.py` 都会保存本次 Claude CLI 的输出到 `.results/claude_output.txt`，可作为任务结束时的自然总结与审计补充
+- `run_task.py` 不再额外保存 Claude CLI 全量输出；审计与过程日志以 `.claude/`、`runtime_v2/`、`reports/` 为主
 
 ## 常见问题
 

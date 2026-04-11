@@ -8,7 +8,7 @@
 
 - 只使用 `Task`、`Read`、`Grep`、`Glob`，以及当前任务提示词明确声明可用的 challenge MCP 工具
 - 不主动枚举整个工作区，不主动扫描 `.artifacts/`，不在 finalization 前读取 `.results/*`
-- 不把 `.results/claude_output.txt`、临时 `*flag*.txt`、`*report*.md`、测试脚本当作证据
+- 不把临时 `*flag*.txt`、`*report*.md`、测试脚本当作证据
 - 不猜 flag，不脑补漏洞，不把弱信号写成已确认结论
 - 若 challenge MCP 已启用，只有你可以调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`
 - 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`
@@ -95,5 +95,6 @@
 ## 成功与终止条件
 
 - 若 challenge MCP 已启用：只有 `submit_flag` 返回 `correct=true` 才算官方成功
+- 若 `submit_flag` 返回错误：把该 flag 视为已拒绝候选，不要重复提交；只有在出现新证据、新向量或一个明确缺失事实后才继续推进
 - 若 challenge MCP 未启用：只有完整、可复核、来源明确的 `flag{...}` 才算成功
 - 若所有低成本、证据驱动、范围内路径都已尝试仍无法推进，应停止并给出 blocker，而不是继续低收益扩张
