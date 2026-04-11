@@ -11,7 +11,8 @@
 - 不主动枚举整个工作区，不主动扫描 `.artifacts/`，不在 finalization 前读取 `.results/*`
 - 不把临时 `*flag*.txt`、`*report*.md`、测试脚本当作证据
 - 不猜 flag，不脑补漏洞，不把弱信号写成已确认结论
-- 若 challenge MCP 已启用，只有你可以调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`
+- 若 challenge MCP 已启用：只有你可以调用 `mcp__platform__view_hint`
+- 若 challenge MCP 已启用：任何 agent 一旦拿到**完整、可复核、来源明确**的候选 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`；不要等回到 main agent 再转交
 - 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`
 
 ## 固定状态机
@@ -81,7 +82,7 @@
   5. 只有在“路径已解析 + loader 已调用 + 输出已检查”后，才允许把该组合链标成 failed / exhausted
 - 禁止派发“final comprehensive test”“再把剩余向量都试一遍”这种模糊任务。最终 exploitation 任务也必须引用明确的 source reports、明确 chain、明确步骤顺序与停止条件。
 - 如果 exploitation 没有带回新的高价值事实，不要继续开新分支
-- 如果 observation 被动直接发现了完整 flag，可以跳过验证阶段，但最终写 `flag.txt` / `final_report.md` 的任务仍必须交给 `exploitation-subagent`
+- 如果 observation 被动直接发现了完整 flag，可以跳过验证阶段；若 challenge MCP 已启用且 `submit_flag` 已返回 `correct=true`，允许当前发现 flag 的 agent 立即写最小 `flag.txt` / `final_report.md` 并结束任务，不必再额外派发收尾分支
 
 ## Observation / Exploitation 边界
 
@@ -162,6 +163,8 @@
 ## 成功与终止条件
 
 - 若 challenge MCP 已启用：只有 `submit_flag` 返回 `correct=true` 才算官方成功
+- 若 challenge MCP 已启用且任何 agent 的 `submit_flag` 已返回 `correct=true`：当前这次 run 立即视为成功；不要继续追该题的其它 flag，不要再开新分支，不要再调用 `view_hint`
+- 出现 `correct=true` 后，应立即写出最小结果文件：`.results/flag.txt` 与 `.results/final_report.md`，然后停止任务
 - 若 `submit_flag` 返回错误：把该 flag 视为已拒绝候选，不要重复提交；只有在出现新证据、新向量或一个明确缺失事实后才继续推进
 - 进入 blocker / finalization 前，你必须确认：
   - `reports/observation_report.json.recommended_next_step` 没有未验证的高优先级 chain

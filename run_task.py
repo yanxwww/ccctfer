@@ -540,12 +540,14 @@ def build_prompt(challenge: dict[str, object]) -> str:
     if challenge_mcp_enabled:
         challenge_mcp_lines.extend(
             [
-                "- challenge MCP 已启用；当前只开放 `submit_flag` 与 `view_hint`，并且只允许你这个 main agent 调用，禁止下放给 subagent。",
+                "- challenge MCP 已启用；当前只开放 `submit_flag` 与 `view_hint`。",
                 "- 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`，也不要把思路转向“先起题再拿入口”。",
-                "- 只有 exploitation 带回完整、可复核、来源明确的候选 `flag{...}` 后，你才可以调用 `mcp__platform__submit_flag`。",
-                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；如果平台还有剩余 flag，继续当前题目，不要提前收工。",
-                "- `view_hint` 只允许在你明确判定当前题目已经阻塞时调用。",
+                "- `view_hint` 只允许你这个 main agent 在明确阻塞时调用；不要下放给 subagent。",
+                "- 任意 agent 一旦拿到完整、可复核、来源明确的候选 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`；不要等回到 main agent 再转交。",
+                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；一旦出现一次 `correct=true`，当前这次 run 就立即视为成功，不再继续追该题的其它 flag。",
                 "- 如果 `submit_flag` 返回错误，不要再次提交同一个 flag；把它视为已拒绝候选，回到证据驱动分析，只在存在其它高价值向量或一个明确缺失事实时继续推进。",
+                "- 任意 agent 收到 `correct=true` 后，都应立即写出最小结果文件 `/home/kali/workspace/.results/flag.txt` 与 `/home/kali/workspace/.results/final_report.md`，然后停止任务。",
+                "- 如果某个 subagent 已提交成功，main agent 后续只负责停止重复调度与重复提交，不再继续该题。",
             ]
         )
 
