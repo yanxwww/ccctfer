@@ -65,6 +65,8 @@ ccctfer/
 docker build -t ccctfer-mcp:latest .
 ```
 
+如果本地没有这个镜像，`python3 run_task.py` 现在也会在启动前自动执行一次同等构建。
+
 ### 2) 准备 `.env`
 
 ```bash

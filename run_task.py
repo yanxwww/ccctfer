@@ -336,14 +336,36 @@ def format_process_error(error: subprocess.CalledProcessError) -> str:
     return "\n".join(part for part in parts if part).strip() or str(error)
 
 
-def ensure_image_exists(image: str) -> None:
+def image_exists(image: str) -> bool:
+    result = run_command(["docker", "image", "inspect", image], check=False)
+    return result.returncode == 0
+
+
+def build_image(image: str, *, docker_platform: str = "") -> None:
+    command = ["docker", "build", "-t", image]
+    if docker_platform:
+        command.extend(["--platform", docker_platform])
+    command.append(str(REPO_ROOT))
     try:
-        run_command(["docker", "image", "inspect", image])
+        run_command(command, capture_output=False)
     except subprocess.CalledProcessError as error:
         raise SystemExit(
-            f"Docker image '{image}' was not found. Build it first with "
-            f"'docker build -t {image} {shlex.quote(str(REPO_ROOT))}'."
+            f"Failed to build Docker image '{image}'.\n"
+            f"Command: {' '.join(shlex.quote(part) for part in command)}\n"
+            f"{format_process_error(error)}"
         ) from error
+
+
+def ensure_image_exists(image: str, *, docker_platform: str = "") -> None:
+    if image_exists(image):
+        return
+    print(f"[!] Docker image '{image}' was not found. Building it now...")
+    build_image(image, docker_platform=docker_platform)
+    if not image_exists(image):
+        raise SystemExit(
+            f"Docker image '{image}' is still unavailable after build. "
+            f"Try running 'docker build -t {image} {shlex.quote(str(REPO_ROOT))}' manually."
+        )
 
 
 def load_runtime_env() -> dict[str, str]:
@@ -1166,7 +1188,7 @@ def has_complete_final_results(task_dir: Path) -> tuple[bool, str | None]:
 
 def main() -> int:
     args = parse_args()
-    ensure_image_exists(args.image)
+    ensure_image_exists(args.image, docker_platform=args.docker_platform)
     runtime_env = load_runtime_env()
     challenge = load_challenge(runtime_env, enable_challenge_mcp=args.enable_challenge_mcp)
 
