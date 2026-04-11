@@ -25,6 +25,9 @@ DEFAULT_READY_TIMEOUT_SECONDS = int(os.getenv("MCP_READY_TIMEOUT_SECONDS", "60")
 DEFAULT_POLL_INTERVAL_SECONDS = float(os.getenv("MCP_POLL_INTERVAL_SECONDS", "1"))
 DEFAULT_DEBUG_MCP_PORT = os.getenv("DEBUG_MCP_PORT")
 DEFAULT_DOCKER_PLATFORM = os.getenv("DOCKER_PLATFORM", "")
+DEFAULT_AGENT_MODE = os.getenv("AGENT_MODE", "orchestrated").strip().lower() or "orchestrated"
+AGENT_TEAMS_ENV_NAME = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
+AGENT_TEAMS_ENV_VALUE = "1"
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
 INPUTS_DIR_NAME = ".inputs"
@@ -45,6 +48,7 @@ RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 EXPLOITATION_INDEX_MERGER_RELATIVE_PATH = ".claude/tools/manage_exploitation_report.py"
+ARTIFACT_SUMMARIZER_RELATIVE_PATH = ".claude/tools/summarize_artifact.py"
 MAX_PARALLEL_EXPLOITATION = 2
 MAX_TOTAL_EXPLOITATION_SUBAGENTS = 5
 MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
@@ -116,6 +120,57 @@ except Exception:
 raise SystemExit(0 if status in {200, 400, 404, 405, 406} else 1)
 """.strip()
 
+PYTHON_EXEC_HEALTHCHECK_SCRIPT = """
+import json
+import sys
+from pathlib import Path
+
+app_dir = Path("/home/kali/python-terminal-mcp/app")
+worker_path = app_dir / "python_session_worker.py"
+if not worker_path.is_file():
+    raise SystemExit(f"python_session_worker.py is missing at {worker_path}")
+
+sys.path.insert(0, str(app_dir))
+import python_terminal_mcp as python_terminal_mcp_module
+
+agent_id = "launcher-healthcheck"
+executor = python_terminal_mcp_module.python_terminal_executor_v2
+executor.configure_runtime("/home/kali/workspace/runtime_v2", workspace_dir="/home/kali/workspace")
+result = executor.python_exec(
+    agent_id=agent_id,
+    code=\"\"\"import requests
+print(requests.__version__)
+print('python-exec-healthcheck-ok')\"\"\",
+    wait_timeout_seconds=5,
+    hard_timeout_seconds=10,
+    background_on_timeout=False,
+)
+
+try:
+    executor.cleanup_agent_runtime(agent_id=agent_id, force=True)
+except Exception:
+    pass
+
+outputs = result.get("outputs") or []
+saw_ok = any(
+    isinstance(item, dict)
+    and item.get("type") == "stream"
+    and "python-exec-healthcheck-ok" in (item.get("text") or "")
+    for item in outputs
+)
+print(
+    json.dumps(
+        {
+            "status": result.get("status"),
+            "error_summary": result.get("error_summary"),
+            "saw_ok": saw_ok,
+        },
+        ensure_ascii=False,
+    )
+)
+raise SystemExit(0 if result.get("status") in {"succeeded", "completed"} and saw_ok else 1)
+""".strip()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one automated CTF task in Docker.")
@@ -160,6 +215,12 @@ def parse_args() -> argparse.Namespace:
         dest="enable_challenge_mcp",
         default=True,
         help="Disable competition challenge MCP integration; by default it is enabled for the main agent only.",
+    )
+    parser.add_argument(
+        "--agent-mode",
+        choices=("single", "orchestrated"),
+        default=DEFAULT_AGENT_MODE if DEFAULT_AGENT_MODE in {"single", "orchestrated"} else "orchestrated",
+        help="Agent workflow mode. 'orchestrated' uses the multi-agent framework; 'single' is an A/B fallback without subagents.",
     )
     return parser.parse_args()
 
@@ -408,6 +469,33 @@ def ensure_canonical_observation_report(task_dir: Path, *, archive_noncanonical:
     return changed
 
 
+def ensure_exploitation_report_index(task_dir: Path) -> None:
+    exploitation_dir = task_dir / EXPLOITATION_REPORTS_RELATIVE_DIR
+    exploitation_dir.mkdir(parents=True, exist_ok=True)
+    index_path = task_dir / EXPLOITATION_MASTER_REPORT_RELATIVE_PATH
+    if index_path.exists():
+        return
+
+    try:
+        run_command(
+            [
+                sys.executable,
+                str(REPO_ROOT / EXPLOITATION_INDEX_MERGER_RELATIVE_PATH),
+                "--index",
+                str(index_path),
+                "--reconcile-dir",
+                str(exploitation_dir),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        print(
+            "[!] Failed to initialize exploitation report index; continuing without a pre-created index.\n"
+            f"{format_process_error(error)}",
+            file=sys.stderr,
+        )
+
+
 def reconcile_exploitation_report_index(task_dir: Path) -> bool:
     exploitation_dir = task_dir / EXPLOITATION_REPORTS_RELATIVE_DIR
     detail_reports = [
@@ -519,7 +607,7 @@ def write_claude_mcp_config(task_dir: Path, runtime_env: dict[str, str], challen
     return config_path
 
 
-def build_prompt(challenge: dict[str, object]) -> str:
+def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrated") -> str:
     entrypoints = challenge["challenge_entrypoints"]
     entrypoint_lines = "\n".join(f"- {item}" for item in entrypoints) if entrypoints else "- (none provided)"
     description = str(challenge["challenge_description"]).strip() or "未提供"
@@ -535,6 +623,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
     result_blocker_report_path = f"/home/kali/workspace/{RESULT_BLOCKER_REPORT_RELATIVE_PATH}"
     observation_merger_path = f"/home/kali/{OBSERVATION_MERGER_RELATIVE_PATH}"
     exploitation_index_merger_path = f"/home/kali/{EXPLOITATION_INDEX_MERGER_RELATIVE_PATH}"
+    artifact_summarizer_path = f"/home/kali/{ARTIFACT_SUMMARIZER_RELATIVE_PATH}"
     challenge_mcp_enabled = bool(challenge.get("challenge_mcp_enabled"))
     challenge_mcp_lines = []
     if challenge_mcp_enabled:
@@ -551,30 +640,76 @@ def build_prompt(challenge: dict[str, object]) -> str:
             ]
         )
 
+    if agent_mode == "single":
+        prompt_lines = [
+            "你正在执行一个授权 Web CTF `find_flag` 任务。",
+            "本轮使用**单智能体精简模式**：不要调用 `Task`，不要创建 subagent，不要套用多 agent 调度模板；你本人直接使用 `mcp__sandbox__*` 工具完成观察、验证、利用和最小落盘。",
+            "",
+            "核心原则：",
+            "- 目标是找到并验证真实 `flag{...}`；不猜 flag，不把候选文件或本地 test flag 当成功。",
+            "- 优先像人工解题一样推进：少量高信息量请求 -> 形成假设 -> 直接验证最高价值路径；不要把问题拆成大量报告分支。",
+            "- 每个阶段只保留少量关键事实。大响应写入 `.artifacts/`，上下文只回传路径、状态、长度、hash、关键词命中和最多 20 行摘要。",
+            f"- 遇到 `bootstrap` / `jquery` / `react` / `vue` / `*.min.js` / `*.min.css` / `chunk` / `bundle` 这类 vendor 资产，或任何超过 4KB 的 HTML/JS/CSS/JSON 正文时，先写入 artifact，再用 `{artifact_summarizer_path}` 生成摘要；不要把全文打回上下文。",
+            "- 优先使用 `mcp__sandbox__python_exec` 进行 HTTP、解析、批量测试和文件写入；普通命令用 `mcp__sandbox__shell_exec`；默认不用交互式 `terminal_*`，除非确实需要 TTY 或长交互。",
+            "- 如果 `python_exec` 对长脚本、结构化抓取或 JSON 生成发生非预期错误，把它视为环境故障并立即停止当前分支；不要把同一段长 Python 脚本降级塞进 `shell_exec`。",
+            "- 不要反复 `Read` 整份大 JSON；需要状态时用 `python_exec` 提取少数字段。",
+            "- 不要读取 `runtime_v2/*`、`.claude/projects/*.jsonl` 或 helper 源码来做任务决策。",
+            "- 能 10 次请求验证的，不要开 50 次字典；payload/路径枚举必须有明确收益和停止条件。",
+            "- 只有看到可复核证据，才确认漏洞或能力；文件可上传/可访问不等于代码执行，报错不等于漏洞成立。",
+            "- 如果发现多个事实能组成利用链，只基于当前题已观察到的事实组合验证；不要套用固定技术路线。",
+            "- 如果某个方向失败，先问：是否前置条件、连接条件、触发点、观测方式缺失；缺失则补最小验证，证据充分才放弃。",
+            *challenge_mcp_lines,
+            "",
+            "输出约定：",
+            f"- 题目信息：`{input_challenge_path}`",
+            f"- 可选观察摘要：`{observation_report_path}`",
+            f"- 可选利用总表：`{exploitation_master_report_path}`",
+            f"- 成功后写：`{result_flag_path}` 与 `{result_final_report_path}`",
+            f"- 阻塞才写：`{result_blocker_report_path}`",
+            "- 报告只写最小必要信息；不要为了报告而消耗主要解题预算。",
+            "",
+            "当前题目：",
+            f"- title: {challenge['challenge_title'] or '(未提供)'}",
+            f"- code: {challenge['challenge_code']}",
+            "- entrypoints:",
+            entrypoint_lines,
+            f"- server_host: {challenge['server_host'] or '(未提供)'}",
+            f"- description: {challenge['challenge_description'] or '(未提供)'}",
+            f"- hint: {challenge['challenge_hint'] or '(未提供)'}",
+            "",
+            "现在开始：先读取题目 JSON，然后直接解题；若拿到完整 flag 且 challenge MCP 可用，立即提交，`correct=true` 后立刻结束。",
+        ]
+        return "\n".join(prompt_lines)
+
     prompt_lines = [
         "你正在执行一个授权 Web CTF `find_flag` 任务。",
-        "先读取 `~/.claude/CLAUDE.md` 并严格执行；这里不再重复模板全文。",
+        "先读取 `~/.claude/CLAUDE.md` 并严格执行；这里只补充本轮题目与会话级参数。",
         "",
-        "本轮只补充会话级约束：",
-        "- 固定状态机：`initial_observation -> targeted_exploitation -> optional_finalization`；只有 exploitation 明确指出缺少某个具体事实时，才允许一次 `supplemental_observation`。",
+        "本轮会话级约束：",
+        "- 固定状态机：`initial_observation -> targeted_exploitation -> optional_finalization`；只有 exploitation 明确缺少某个具体事实时，才允许一次 `supplemental_observation`。",
         "- 起步只允许 1 个 `observation-subagent`。",
+        "- observation 一旦达到可利用 checkpoint，就应先结束当前轮并把主文件交回；不要为了“还能多收集一些背景”而继续独占时间片。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
-        "- 新线索如果只是现有利用链的子步骤，必须继续沿用该链已有的 detail JSON 和 owner subagent 语义，不得再拆成新的 sibling 分支。",
-        "- 只有当向量彼此独立、端点/目标不同、现有 detail 文件未覆盖，而且任务可以被一句话清楚限定时，才允许新开 `exploitation-subagent`。",
-        "- 每次 observation merge 后、每次 exploitation 总表更新后，先只检查 exploitation 总表里的四个结构化状态：`summary.key_facts`、`summary.confirmed_capabilities`、`summary.composed_chains`、`summary.priority_actions`，以及 observation 主文件里的 `recommended_next_step`。",
-        "- 如果 upload/write primitive、可预测可访问路径、以及 template/include/render loader 同时存在，必须优先作为**一条组合链**派发；不要把同一条链再拆成多个后缀/探针/单文件平行小分支。",
-        "- 已确认 capability 是 sticky 的：后续某个 payload / 路径失败，不能推翻之前已确认的 loader、upload path、目录索引、有效 session 等事实；失败只代表这次组合尝试未闭环。",
-        "- 如果 exploitation 总表把某条链标成 `ready_for_validation`、`in_progress` 或 `attempted_but_incomplete`，就说明它还没有闭环；不要被单个 detail JSON 里的悲观总结带偏。",
-        "- 对 upload + loader 组合链，派单时必须写清：认证前提、上传动作、上传前后目录 diff/枚举、实际落盘路径解析、最终 loader 调用；不要只测若干猜测路径就宣布失败。",
-        "- 禁止派发“final comprehensive test”“把剩余向量都再试一遍”这类模糊任务；最终 exploitation 任务也必须引用明确 source reports、明确 chain、明确步骤顺序与停止条件。",
-        "- 非 finalization 阶段不得读取 `.results/*`；在 `recommended_next_step` 或 `priority_actions` 仍有高价值动作时，禁止 blocker/finalization。",
-        "- main agent 自己不执行 `mcp__sandbox__*`；subagent 一律先 `python_exec`，再 `shell_exec`，最后才是 `terminal_*`。",
-        "- 长 `.py` / `.json` / `.md` / update payload 必须优先用 `python_exec` 生成；不要用 shell heredoc、`cat > file`、或超长 `shell_exec`/`terminal_write` 输入去写文件。",
-        "- helper 成功后不要再 `cat` / `head` / `json.tool` 回读刚写出的报告；只有确实需要某个字段时再按字段提取。",
-        "- 同一阶段内不要反复整份 `Read` 同一个 observation / exploitation 报告；只有在 subagent 完成、helper merge 成功、或你明确需要一个此前未提取的字段时才允许再次读取。",
-        "- exploitation detail JSON 只保留最小 canonical 字段：`target`、`hypothesis_id`、`title`、`status`、`confidence`、对象型 `summary`、`evidence`、`new_facts`、`recommendation`、`needs_more_observation`、`artifacts`，以及必要时的 `chain_validation`；不要再平行堆 `key_findings` / `conclusions` / `next_actions` / `next_steps`。",
-        "- 不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`；不要把超过 4KB 的 artifact 正文带回上下文。",
-        "- 不要用 `shell_exec` 的 heredoc / `cat > file` 写长脚本、长 JSON、长 markdown；超过几行就必须改用 `python_exec`。",
+        "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链必须优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",
+        "- 如果 `Agent` / `Task` tool_result 已返回 `agentId` 并提示可用 `SendMessage` 继续，把该 agent 视为这条链的默认 owner。",
+        "- 如果当前环境支持 Agent Teams / resume，owner 暂停时优先恢复原 owner；只有无法继续时才新开 agent。",
+        "- `supplemental_observation` 默认优先 `SendMessage` 继续原 observation owner，而不是新开 observation sibling。",
+        "- 给 exploitation 派单时必须写清“只验证到哪一步就停止”；不要让 subagent 自行升级到更深验证。若你需要进一步探索，就用 `SendMessage` 唤醒同一 owner 并给新的窄任务说明。",
+        "- `summary.priority_actions` 是候选队列，不是自动派单列表；新开 exploitation 前先做一次轻量四因子判断：证据强度、独立性/链路契合、预期收益、预计成本。",
+        "- 默认只并行高收益且低/中成本的前 1-2 个动作；高噪声枚举、大范围 brute force、需要消化大量正文的动作，除非能闭合一条 `ready_for_validation` / `in_progress` 组合链，否则不要占用默认并行位。",
+        "- 如果当前同时存在 2 个彼此独立且高价值的 exploitation 动作，先把这 2 个都派出去；不要串行等第 1 个结束后才决定第 2 个，除非第 2 个确实依赖第 1 个结果。",
+        "- `targeted_exploitation` 起步优先做一轮广度优先的 initial exploitation wave：先让更多独立高价值向量完成首轮浅验证，再决定谁值得深挖。",
+        "- 只要队列里还有尚未做首轮验证的高价值独立向量，就不要急着把并行位长期占给同一条链的深度 follow-up；优先补齐这些首轮 exploitation。",
+        "- 只有当高价值独立向量的首轮验证基本完成，或某条链已出现强阳性信号并且再走一步就可能直接拿到 flag / file read / code exec 时，才优先深挖该链。",
+        "- observation 达到 checkpoint 后的停止表示“本轮暂停并交棒”，不是 observation 生命周期终止；initial exploitation wave 启动后，要主动判断是否应 `SendMessage` 继续 observation owner。",
+        "- 如果还存在未展开的独立 surface / atomic hypothesis、exploitation 返回了明确缺失事实、或当前 exploitation 队列未满且 observation 还能低成本补高价值事实，优先继续原 observation owner。",
+        "- observation 审查优先看：`recommended_next_step` 与 `hypotheses[*].combines_with`。",
+        "- exploitation 审查优先看总表：`summary.key_facts`、`summary.confirmed_capabilities`、`summary.composed_chains`、`summary.priority_actions`。",
+        "- 新开 exploitation 分支前先确认：向量独立、detail 路径唯一、endpoint/参数/范围/停止条件能一句话说清。",
+        "- `failed` / `blocked` / `exhausted` 不是终判；若缺少前提、连接条件、触发点或观测证据，把它视为 `attempted_but_incomplete`，优先继续同一 owner。",
+        "- main agent 自己不执行 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
+        "- 非 finalization 阶段不读 `.results/*`；不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`。",
+        "- helper 写完报告后不要整份回读；只有确实缺字段时再做按字段提取。",
         *challenge_mcp_lines,
         "",
         "关键路径：",
@@ -584,6 +719,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
         f"- exploitation master: `{exploitation_master_report_path}`",
         f"- exploitation detail pattern: `{exploitation_detail_pattern_path}`",
         f"- exploitation merge helper: `{exploitation_index_merger_path}`",
+        f"- artifact summarizer: `{artifact_summarizer_path}`",
         f"- observation artifacts: `{observation_artifacts_dir}`",
         f"- exploitation artifacts: `{exploitation_artifacts_dir}`",
         f"- results dir: `/home/kali/workspace/{RESULTS_DIR_NAME}/`",
@@ -595,6 +731,8 @@ def build_prompt(challenge: dict[str, object]) -> str:
         f"题目标识：{challenge['challenge_code']}",
         "入口点：",
         entrypoint_lines,
+        "",
+        "现在开始：先读取 challenge JSON，再启动 1 个 `observation-subagent`。只要它产出第一个可利用 checkpoint，就立刻进入 exploitation 调度；若有两个独立高价值动作，优先并行派出，并先完成一轮广度优先的浅验证。checkpoint 不是 observation 的终局；后续若仍有未展开 surface 或明确缺失事实，优先继续同一 observation owner。",
     ]
 
     if challenge_mcp_enabled:
@@ -639,6 +777,23 @@ def wait_for_mcp(container_name: str, timeout_seconds: int, poll_interval_second
 
     logs = run_command(["docker", "logs", container_name], check=False).stdout
     raise SystemExit(f"MCP server did not become ready within {timeout_seconds} seconds.\n{logs}")
+
+
+def verify_python_exec(container_name: str) -> None:
+    result = docker_exec_python(container_name, PYTHON_EXEC_HEALTHCHECK_SCRIPT, check=False)
+    if result.returncode == 0:
+        return
+
+    details = []
+    if result.stderr and result.stderr.strip():
+        details.append(result.stderr.strip())
+    if result.stdout and result.stdout.strip():
+        details.append(result.stdout.strip())
+    logs = run_command(["docker", "logs", container_name], check=False).stdout.strip()
+    if logs:
+        details.append(logs)
+    detail_text = "\n".join(part for part in details if part).strip() or "unknown error"
+    raise SystemExit(f"python_exec health check failed before Claude started.\n{detail_text}")
 
 
 def interrupt_claude(container_name: str) -> None:
@@ -753,31 +908,56 @@ def build_run_command(
         value = runtime_env.get(key)
         if value:
             command.extend(["-e", f"{key}={value}"])
+    command.extend(["-e", f"{AGENT_TEAMS_ENV_NAME}={AGENT_TEAMS_ENV_VALUE}"])
 
     command.append(args.image)
     command.extend(["bash", "-c", container_start_script()])
     return command
 
 
-def build_claude_shell_command(*, challenge_mcp_enabled: bool = False) -> str:
-    tools = "Task,Read,Grep,Glob"
-    platform_tools = ""
-    if challenge_mcp_enabled:
-        tools += ",mcp__platform__submit_flag,mcp__platform__view_hint"
-        platform_tools = " mcp__platform__submit_flag mcp__platform__view_hint"
+SANDBOX_TOOL_NAMES = (
+    "mcp__sandbox__python_exec",
+    "mcp__sandbox__python_get",
+    "mcp__sandbox__python_output",
+    "mcp__sandbox__python_interrupt",
+    "mcp__sandbox__python_restart",
+    "mcp__sandbox__python_session_info",
+    "mcp__sandbox__shell_exec",
+    "mcp__sandbox__terminal_open",
+    "mcp__sandbox__terminal_info",
+    "mcp__sandbox__terminal_read",
+    "mcp__sandbox__terminal_write",
+    "mcp__sandbox__terminal_interrupt",
+    "mcp__sandbox__terminal_close",
+    "mcp__sandbox__list_agent_runtimes",
+    "mcp__sandbox__cleanup_agent_runtime",
+)
 
+
+def build_claude_shell_command(*, challenge_mcp_enabled: bool = False, agent_mode: str = "orchestrated") -> str:
+    base_tools = ["Read", "Grep", "Glob"]
+    if agent_mode == "orchestrated":
+        base_tools = ["Agent", "Task", "SendMessage", *base_tools]
+    platform_tool_names: list[str] = []
+    if challenge_mcp_enabled:
+        platform_tool_names = ["mcp__platform__submit_flag", "mcp__platform__view_hint"]
+
+    if agent_mode == "single":
+        visible_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
+        allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
+    else:
+        visible_tools = [*base_tools, *platform_tool_names]
+        allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
+
+    tools = ",".join(visible_tools)
+    allowed_tools_text = " ".join(allowed_tools)
     return (
+        f"export {AGENT_TEAMS_ENV_NAME}={AGENT_TEAMS_ENV_VALUE} && "
         "claude --verbose "
         "--mcp-config /home/kali/.claude/mcp.json "
         "--strict-mcp-config "
         f'--tools "{tools}" '
-        '--allowedTools "Task Read Grep Glob '
-        'mcp__sandbox__python_exec mcp__sandbox__python_get mcp__sandbox__python_output '
-        'mcp__sandbox__python_interrupt mcp__sandbox__python_restart mcp__sandbox__python_session_info '
-        'mcp__sandbox__shell_exec '
-        'mcp__sandbox__terminal_open mcp__sandbox__terminal_info mcp__sandbox__terminal_read '
-        'mcp__sandbox__terminal_write mcp__sandbox__terminal_interrupt mcp__sandbox__terminal_close '
-        f'mcp__sandbox__list_agent_runtimes mcp__sandbox__cleanup_agent_runtime{platform_tools}" '
+        f'--allowedTools "{allowed_tools_text}" '
         '--disallowedTools "Bash Write Edit MultiEdit WebFetch WebSearch NotebookRead NotebookEdit LS" '
         '-p "$(cat)"'
     )
@@ -789,6 +969,7 @@ def run_claude_task(
     timeout_seconds: int,
     *,
     challenge_mcp_enabled: bool = False,
+    agent_mode: str = "orchestrated",
 ) -> tuple[int, bool]:
     command = [
         "docker",
@@ -799,7 +980,7 @@ def run_claude_task(
         container_name,
         "bash",
         "-c",
-        build_claude_shell_command(challenge_mcp_enabled=challenge_mcp_enabled),
+        build_claude_shell_command(challenge_mcp_enabled=challenge_mcp_enabled, agent_mode=agent_mode),
     ]
     process = subprocess.Popen(command, stdin=subprocess.PIPE, text=True)
     try:
@@ -1001,6 +1182,7 @@ def main() -> int:
     initialize_workspace_claude_config(task_dir)
     write_claude_mcp_config(task_dir, runtime_env, challenge)
     ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
+    ensure_exploitation_report_index(task_dir)
 
     container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}")
     try:
@@ -1014,13 +1196,15 @@ def main() -> int:
     exit_code = 1
     try:
         wait_for_mcp(container_name, args.ready_timeout_seconds, args.poll_interval_seconds)
-        print("[+] MCP server is ready, starting Claude task...")
-        prompt = build_prompt(challenge)
+        verify_python_exec(container_name)
+        print("[+] MCP server and python_exec are ready, starting Claude task...")
+        prompt = build_prompt(challenge, agent_mode=args.agent_mode)
         exit_code, timed_out = run_claude_task(
             container_name,
             prompt,
             args.timeout_seconds,
             challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
+            agent_mode=args.agent_mode,
         )
         repaired_observation = ensure_canonical_observation_report(task_dir, archive_noncanonical=True)
         if repaired_observation:

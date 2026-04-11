@@ -84,8 +84,11 @@ def collapse_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def normalize_url(value: str) -> str:
-    split = urlsplit(value.strip())
+def normalize_url(value: Any) -> str:
+    text = collapse_text(value)
+    if not text:
+        return ""
+    split = urlsplit(text)
     scheme = split.scheme.lower()
     hostname = (split.hostname or "").lower()
     port = split.port
@@ -101,6 +104,12 @@ def normalize_url(value: str) -> str:
 
 
 def normalize_path(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("path", "url", "endpoint", "entrypoint", "href", "action", "file"):
+            normalized = normalize_path(value.get(key))
+            if normalized:
+                return normalized
+        return ""
     text = collapse_text(value)
     if not text:
         return ""
@@ -130,6 +139,55 @@ def ensure_list(value: Any) -> list[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def target_url_from_item(item: Any) -> str:
+    if isinstance(item, dict):
+        for key in ("url", "entrypoint", "endpoint", "path", "href", "uri", "location"):
+            normalized = normalize_path(item.get(key))
+            if normalized:
+                return normalized
+        return ""
+    return normalize_path(item)
+
+
+def coerce_target_urls(value: Any) -> list[str]:
+    urls = [url for item in ensure_list(value) if (url := target_url_from_item(item))]
+    return unique_list(urls, normalize_path)
+
+
+def target_port_from_item(item: Any) -> Any:
+    if isinstance(item, dict):
+        for key in ("port", "number", "value"):
+            if item.get(key) not in (None, ""):
+                return item[key]
+        return None
+    return item
+
+
+def coerce_target_ports(value: Any) -> list[Any]:
+    ports = [port for item in ensure_list(value) if (port := target_port_from_item(item)) not in (None, "")]
+    return unique_list(ports, normalize_scalar)
+
+
+def coerce_target_technologies(value: Any) -> list[str]:
+    technologies: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+            return
+        if isinstance(item, list):
+            for child in item:
+                visit(child)
+            return
+        text = collapse_text(item)
+        if text:
+            technologies.append(text)
+
+    visit(value)
+    return unique_list(technologies, normalize_name)
 
 
 def is_canonical_report(value: Any) -> bool:
@@ -163,6 +221,26 @@ def add_note_evidence(report: dict[str, Any], *, note_type: str, source: str, su
     if details not in (None, "", [], {}):
         item["details"] = copy.deepcopy(details)
     report["evidence"].append(item)
+
+
+def coerce_reference_list(value: Any) -> list[str]:
+    references: list[str] = []
+    for item in ensure_list(value):
+        if isinstance(item, dict):
+            family = collapse_text(item.get("family") or item.get("type") or item.get("category"))
+            claim = collapse_text(item.get("claim") or item.get("description") or item.get("title") or item.get("summary"))
+            identifier = collapse_text(item.get("id"))
+            if family and claim:
+                references.append(f"{family}: {claim}")
+            elif claim:
+                references.append(claim)
+            elif identifier:
+                references.append(identifier)
+            continue
+        text = collapse_text(item)
+        if text:
+            references.append(text)
+    return list(dict.fromkeys(references))
 
 
 def coerce_hypothesis(item: Any) -> dict[str, Any] | None:
@@ -208,6 +286,12 @@ def coerce_hypothesis(item: Any) -> dict[str, Any] | None:
             minimal_checks.append(collapse_text(value))
     if minimal_checks:
         hypothesis["minimal_checks"] = list(dict.fromkeys(minimal_checks))
+
+    combines_with: list[str] = []
+    for key in ("combines_with", "related_hypotheses", "related_to", "combination_hints"):
+        combines_with.extend(coerce_reference_list(item.get(key)))
+    if combines_with:
+        hypothesis["combines_with"] = list(dict.fromkeys(combines_with))
 
     notes = collapse_text(item.get("notes") or item.get("note"))
     if notes:
@@ -279,7 +363,7 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
         value = payload.get(key)
         if key not in payload:
             continue
-        if key in {"target", "surface_map", "recommended_next_step"} and isinstance(value, dict):
+        if key in {"surface_map", "recommended_next_step"} and isinstance(value, dict):
             report[key] = copy.deepcopy(value)
         elif key in {"evidence", "hypotheses", "negative_findings", "unknowns"} and isinstance(value, list):
             report[key] = copy.deepcopy(value)
@@ -292,11 +376,16 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
             report["target"]["entrypoints"].append(normalized_target)
 
     if isinstance(target_value, dict):
-        for field in ("scope", "entrypoints", "ports", "technologies"):
+        for field, coercer, normalizer in (
+            ("scope", coerce_target_urls, normalize_url),
+            ("entrypoints", coerce_target_urls, normalize_url),
+            ("ports", coerce_target_ports, normalize_scalar),
+            ("technologies", coerce_target_technologies, normalize_name),
+        ):
             report["target"][field] = merge_scalar_lists(
                 report["target"].get(field, []),
-                ensure_list(target_value.get(field)),
-                normalize_scalar if field == "ports" else (normalize_name if field == "technologies" else normalize_path),
+                coercer(target_value.get(field)),
+                normalizer,
             )
 
     findings = payload.get("findings") if isinstance(payload.get("findings"), dict) else {}
@@ -305,10 +394,11 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
     technologies.extend(ensure_list(payload.get("tech_stack")))
     technologies.extend(ensure_list(findings.get("tech_stack")))
     technologies.extend(ensure_list(payload.get("technologies")))
-    for technology in technologies:
-        text = collapse_text(technology)
-        if text:
-            report["target"]["technologies"].append(text)
+    report["target"]["technologies"] = merge_scalar_lists(
+        report["target"]["technologies"],
+        coerce_target_technologies(technologies),
+        normalize_name,
+    )
 
     extend_endpoints(report, payload.get("endpoints"))
     extend_endpoints(report, findings.get("endpoints"))
@@ -623,12 +713,29 @@ def merge_record_list(
 
 def merge_hypothesis(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     merged = merge_generic_record(existing, incoming)
-    merged["basis"] = merge_scalar_lists(existing.get("basis", []), incoming.get("basis", []), normalize_scalar)
-    merged["minimal_checks"] = merge_scalar_lists(
+    basis = merge_scalar_lists(existing.get("basis", []), incoming.get("basis", []), normalize_scalar)
+    minimal_checks = merge_scalar_lists(
         existing.get("minimal_checks", []),
         incoming.get("minimal_checks", []),
         normalize_scalar,
     )
+    combines_with = merge_scalar_lists(
+        existing.get("combines_with", []),
+        incoming.get("combines_with", []),
+        normalize_scalar,
+    )
+    if basis:
+        merged["basis"] = basis
+    else:
+        merged.pop("basis", None)
+    if minimal_checks:
+        merged["minimal_checks"] = minimal_checks
+    else:
+        merged.pop("minimal_checks", None)
+    if combines_with:
+        merged["combines_with"] = combines_with
+    else:
+        merged.pop("combines_with", None)
     for field in ("confidence", "status", "notes"):
         if collapse_text(incoming.get(field)):
             merged[field] = incoming[field]
@@ -691,16 +798,24 @@ def merge_surface_map(existing: dict[str, Any], incoming: dict[str, Any]) -> dic
 
 def merge_target(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(existing)
-    merged["scope"] = merge_scalar_lists(existing.get("scope", []), incoming.get("scope", []), normalize_url)
-    merged["entrypoints"] = merge_scalar_lists(
-        existing.get("entrypoints", []),
-        incoming.get("entrypoints", []),
+    merged["scope"] = merge_scalar_lists(
+        coerce_target_urls(existing.get("scope", [])),
+        coerce_target_urls(incoming.get("scope", [])),
         normalize_url,
     )
-    merged["ports"] = merge_scalar_lists(existing.get("ports", []), incoming.get("ports", []), normalize_scalar)
+    merged["entrypoints"] = merge_scalar_lists(
+        coerce_target_urls(existing.get("entrypoints", [])),
+        coerce_target_urls(incoming.get("entrypoints", [])),
+        normalize_url,
+    )
+    merged["ports"] = merge_scalar_lists(
+        coerce_target_ports(existing.get("ports", [])),
+        coerce_target_ports(incoming.get("ports", [])),
+        normalize_scalar,
+    )
     merged["technologies"] = merge_scalar_lists(
-        existing.get("technologies", []),
-        incoming.get("technologies", []),
+        coerce_target_technologies(existing.get("technologies", [])),
+        coerce_target_technologies(incoming.get("technologies", [])),
         normalize_name,
     )
     return merged
@@ -738,7 +853,6 @@ def merge_report(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
         if not priority or priority in known_ids:
             report["recommended_next_step"] = copy.deepcopy(incoming_next)
 
-    report = apply_derived_attack_chain_hints(report)
     report["evidence"] = ensure_unique_ids(report.get("evidence", []), "ev")
     report["hypotheses"] = ensure_unique_ids(report.get("hypotheses", []), "h")
     return report
@@ -765,174 +879,6 @@ def ensure_unique_ids(items: list[dict[str, Any]], prefix: str) -> list[dict[str
         used.add(collapse_text(current.get("id")))
         normalized.append(current)
     return normalized
-
-
-def report_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False).lower()
-
-
-def collect_text_fragments(value: Any) -> list[str]:
-    fragments: list[str] = []
-
-    def visit(node: Any) -> None:
-        if isinstance(node, str):
-            text = collapse_text(node)
-            if text:
-                fragments.append(text.lower())
-            return
-        if isinstance(node, dict):
-            for key, child in node.items():
-                visit(key)
-                visit(child)
-            return
-        if isinstance(node, list):
-            for child in node:
-                visit(child)
-
-    visit(value)
-    return fragments
-
-
-def has_directory_constraint_loader_error(text: str) -> bool:
-    generic_markers = (
-        "outside the allowed directory",
-        "outside template root",
-        "outside the templates directory",
-        "outside the upload directory",
-        "not in allowed path",
-        "not within the allowed path",
-        "not under the allowed directory",
-        "template located outside",
-        "located outside the static directory",
-    )
-    if any(marker in text for marker in generic_markers):
-        return True
-    return bool(
-        ("outside" in text or "not in" in text or "not under" in text)
-        and ("directory" in text or "path" in text or "template root" in text)
-        and ("template" in text or "loader" in text or "render" in text or "include" in text)
-    )
-
-
-def has_uploaded_content_loader_chain_signals(report: dict[str, Any]) -> bool:
-    text_fragments = collect_text_fragments(
-        {
-            "surface_map": report.get("surface_map", {}),
-            "evidence": report.get("evidence", []),
-            "hypotheses": report.get("hypotheses", []),
-            "negative_findings": report.get("negative_findings", []),
-            "recommended_next_step": report.get("recommended_next_step", {}),
-        }
-    )
-    text = "\n".join(text_fragments)
-    upload_points = report.get("surface_map", {}).get("upload_points", [])
-    files_map = report.get("surface_map", {}).get("files", {})
-    parameters = report.get("surface_map", {}).get("parameters", [])
-
-    upload_signal = any(
-        marker in text
-        for marker in (
-            "file_upload",
-            "multipart/form-data",
-            "upload_points",
-            "upload_path",
-            "write primitive",
-            "write capability",
-            "uploaded file",
-            "directory listing",
-        )
-    ) or bool(upload_points)
-    predictable_path_signal = any(
-        marker in text
-        for marker in (
-            "/static/",
-            "/uploads/",
-            "/files/",
-            "/media/",
-            "/public/",
-            "access_url",
-            "public url",
-            "web-accessible",
-            "reachable under /static",
-            "directory listing enabled",
-        )
-    ) or any(
-        marker in report_text(files_map)
-        for marker in ("/static/", "/uploads/", "/files/", "/media/", "/public/")
-    )
-    template_loader_signal = has_directory_constraint_loader_error(text)
-    path_controlled_loader_signal = (
-        template_loader_signal
-        or (
-            ("template" in text or "render" in text or "include" in text or "loader" in text)
-            and (
-                "path" in text
-                or "error_type" in text
-                or "view" in text
-                or "page" in text
-                or "file" in text
-                or "name" in text
-                or "template" in text
-            )
-        )
-        or any(
-            any(keyword in report_text(item) for keyword in ("template", "render", "include", "loader", "view"))
-            and any(keyword in report_text(item) for keyword in ("path", "file", "page", "name", "template"))
-            for item in parameters
-        )
-    )
-    return upload_signal and predictable_path_signal and path_controlled_loader_signal
-
-
-def apply_derived_attack_chain_hints(report: dict[str, Any]) -> dict[str, Any]:
-    if not has_uploaded_content_loader_chain_signals(report):
-        return report
-
-    chain_hypothesis = {
-        "id": "chain_uploaded_content_loader",
-        "family": "attack_chain",
-        "claim": (
-            "The target appears to expose both (1) attacker-controlled file/content placement in a web-accessible directory and "
-            "(2) a path-controlled template/include/render primitive constrained to an allowed directory. "
-            "The next high-value chain is to upload a benign HTML/template payload and then invoke the loader with the uploaded path "
-            "to test server-side template execution, file inclusion, flag disclosure, or controlled code execution."
-        ),
-        "confidence": "high",
-        "status": "ready_for_exploitation",
-        "basis": [
-            "An upload/write primitive exists and attacker-controlled content lands in a predictable accessible path",
-            "A path-controlled template/include/render primitive exists but is constrained to an allowed directory",
-            "Directory-constraint errors are a positive capability hint, not just a dead-end traversal result",
-        ],
-        "minimal_checks": [
-            "Authenticate if the upload or loader path requires a valid session",
-            "Upload a small .html or template file containing a harmless probe such as {{7*7}}",
-            "Invoke the path-controlled loader/render/include entrypoint with the uploaded relative path",
-            "If evaluation/inclusion occurs, escalate carefully toward file read or flag extraction and avoid open-ended probing",
-        ],
-        "notes": "Treat this as a composed uploaded-content + loader/render chain. Do not finalize blocker status before this chain has been tested.",
-    }
-    report["hypotheses"] = merge_record_list(
-        report.get("hypotheses", []),
-        [chain_hypothesis],
-        key_fn=hypothesis_key,
-        merge_fn=merge_hypothesis,
-    )
-
-    report["recommended_next_step"] = {
-        "action": (
-            "Prioritize a composed exploitation task: place a benign HTML/template payload through the confirmed write/upload primitive, "
-            "then invoke the path-controlled loader/render/include entrypoint with that uploaded path. Treat directory-constraint errors "
-            "as evidence of a controllable loader primitive, not as a fully dead traversal result."
-        ),
-        "notes": [
-            "Use a harmless probe first, such as {{7*7}}, to confirm template execution.",
-            "If execution is confirmed, move to controlled flag-read or file-read payloads rather than broad exploitation.",
-            "Do not close the task as blocked until this uploaded-content + loader chain has been explicitly tested.",
-        ],
-        "priority_hypothesis": "chain_uploaded_content_loader",
-    }
-    return report
 
 
 def main() -> int:

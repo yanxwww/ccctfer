@@ -3,7 +3,7 @@
 一个基于 Docker 的 CTF 自动化执行框架：
 - 容器内启动 `python_terminal_mcp`（MCP 服务）
 - 使用 `run_task.py` 生成任务工作区并调用 `claude` 执行主流程
-- 通过受限工具集（`Task/Read/Grep/Glob` + `mcp__sandbox__*`）完成 observation/exploitation 流程
+- 默认使用多 agent 调度模式；可显式切换到单智能体精简模式做 A/B 或应急验证
 - 默认通过 challenge MCP 为 main agent 接入比赛平台工具；如需关闭，显式传入 `--disable-challenge-mcp`
 
 ## 项目结构
@@ -55,6 +55,7 @@ ccctfer/
 - `MCP_POLL_INTERVAL_SECONDS`（默认 `1`）
 - `DEBUG_MCP_PORT`（不设置则不映射）
 - `DOCKER_PLATFORM`（例如 `linux/amd64`）
+- `AGENT_MODE`（默认 `orchestrated`；可设为 `single` 禁用 subagent 做 A/B 对照）
 
 ## 快速开始
 
@@ -84,6 +85,12 @@ ANTHROPIC_MODEL=your-model
 
 ```bash
 python3 run_task.py
+```
+
+默认 `--agent-mode orchestrated`，使用 observation/exploitation 多 agent 框架。若需要做单智能体 A/B 或应急验证，可显式传入：
+
+```bash
+python3 run_task.py --agent-mode single
 ```
 
 默认会给 main agent 开启 `submit_flag` / `view_hint` 对应的比赛平台 MCP 集成，因此需要确保 `.env` 或当前 shell 中同时存在：
