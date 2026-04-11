@@ -1,0 +1,11 @@
+.DS_Store
+**/.DS_Store
+.env
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+workspace/
+runtime_v2/
