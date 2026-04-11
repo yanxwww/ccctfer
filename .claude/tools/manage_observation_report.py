@@ -537,8 +537,26 @@ def token_key(item: Any) -> str:
     return normalize_name(item)
 
 
-def js_lead_key(item: dict[str, Any]) -> str:
-    return normalize_path(item.get("file") or item.get("path"))
+def coerce_javascript_lead(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        normalized = copy.deepcopy(item)
+        path = normalize_path(normalized.get("file") or normalized.get("path") or normalized.get("url"))
+        if not path:
+            return None
+        if not collapse_text(normalized.get("path")):
+            normalized["path"] = path
+        return normalized
+    path = normalize_path(item)
+    if not path:
+        return None
+    return {"path": path}
+
+
+def js_lead_key(item: Any) -> str:
+    normalized = coerce_javascript_lead(item)
+    if not normalized:
+        return ""
+    return normalize_path(normalized.get("file") or normalized.get("path"))
 
 
 def auth_surface_key(item: dict[str, Any]) -> str:
@@ -568,16 +586,24 @@ def negative_finding_key(item: Any) -> str:
 
 
 def merge_record_list(
-    existing: list[dict[str, Any]],
-    incoming: list[dict[str, Any]],
+    existing: list[Any],
+    incoming: list[Any],
     *,
     key_fn,
     id_prefix: str | None = None,
     merge_fn=merge_generic_record,
+    coerce_item=None,
 ) -> list[dict[str, Any]]:
-    merged = [copy.deepcopy(item) for item in existing]
+    merged: list[dict[str, Any]] = []
+    for item in existing:
+        normalized = coerce_item(item) if coerce_item else (copy.deepcopy(item) if isinstance(item, dict) else None)
+        if isinstance(normalized, dict):
+            merged.append(normalized)
     index = {key_fn(item): position for position, item in enumerate(merged) if key_fn(item)}
     for item in incoming:
+        item = coerce_item(item) if coerce_item else item
+        if not isinstance(item, dict):
+            continue
         key = key_fn(item)
         if key and key in index:
             position = index[key]
@@ -643,6 +669,7 @@ def merge_surface_map(existing: dict[str, Any], incoming: dict[str, Any]) -> dic
         existing.get("javascript_leads", []),
         incoming.get("javascript_leads", []),
         key_fn=js_lead_key,
+        coerce_item=coerce_javascript_lead,
     )
     merged["auth_surfaces"] = merge_record_list(
         existing.get("auth_surfaces", []),
@@ -711,6 +738,200 @@ def merge_report(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
         if not priority or priority in known_ids:
             report["recommended_next_step"] = copy.deepcopy(incoming_next)
 
+    report = apply_derived_attack_chain_hints(report)
+    report["evidence"] = ensure_unique_ids(report.get("evidence", []), "ev")
+    report["hypotheses"] = ensure_unique_ids(report.get("hypotheses", []), "h")
+    return report
+
+
+def ensure_unique_ids(items: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    used: set[str] = set()
+    highest = 0
+    pattern = re.compile(rf"^{re.escape(prefix)}[-_]?(\d+)$", re.IGNORECASE)
+
+    for item in items:
+        current_id = collapse_text(item.get("id"))
+        match = pattern.match(current_id)
+        if match:
+            highest = max(highest, int(match.group(1)))
+
+    for item in items:
+        current = copy.deepcopy(item)
+        current_id = collapse_text(current.get("id"))
+        if not current_id or current_id in used:
+            highest += 1
+            current["id"] = f"{prefix}_{highest:03d}"
+        used.add(collapse_text(current.get("id")))
+        normalized.append(current)
+    return normalized
+
+
+def report_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False).lower()
+
+
+def collect_text_fragments(value: Any) -> list[str]:
+    fragments: list[str] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, str):
+            text = collapse_text(node)
+            if text:
+                fragments.append(text.lower())
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                visit(key)
+                visit(child)
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(value)
+    return fragments
+
+
+def has_directory_constraint_loader_error(text: str) -> bool:
+    generic_markers = (
+        "outside the allowed directory",
+        "outside template root",
+        "outside the templates directory",
+        "outside the upload directory",
+        "not in allowed path",
+        "not within the allowed path",
+        "not under the allowed directory",
+        "template located outside",
+        "located outside the static directory",
+    )
+    if any(marker in text for marker in generic_markers):
+        return True
+    return bool(
+        ("outside" in text or "not in" in text or "not under" in text)
+        and ("directory" in text or "path" in text or "template root" in text)
+        and ("template" in text or "loader" in text or "render" in text or "include" in text)
+    )
+
+
+def has_uploaded_content_loader_chain_signals(report: dict[str, Any]) -> bool:
+    text_fragments = collect_text_fragments(
+        {
+            "surface_map": report.get("surface_map", {}),
+            "evidence": report.get("evidence", []),
+            "hypotheses": report.get("hypotheses", []),
+            "negative_findings": report.get("negative_findings", []),
+            "recommended_next_step": report.get("recommended_next_step", {}),
+        }
+    )
+    text = "\n".join(text_fragments)
+    upload_points = report.get("surface_map", {}).get("upload_points", [])
+    files_map = report.get("surface_map", {}).get("files", {})
+    parameters = report.get("surface_map", {}).get("parameters", [])
+
+    upload_signal = any(
+        marker in text
+        for marker in (
+            "file_upload",
+            "multipart/form-data",
+            "upload_points",
+            "upload_path",
+            "write primitive",
+            "write capability",
+            "uploaded file",
+            "directory listing",
+        )
+    ) or bool(upload_points)
+    predictable_path_signal = any(
+        marker in text
+        for marker in (
+            "/static/",
+            "/uploads/",
+            "/files/",
+            "/media/",
+            "/public/",
+            "access_url",
+            "public url",
+            "web-accessible",
+            "reachable under /static",
+            "directory listing enabled",
+        )
+    ) or any(
+        marker in report_text(files_map)
+        for marker in ("/static/", "/uploads/", "/files/", "/media/", "/public/")
+    )
+    template_loader_signal = has_directory_constraint_loader_error(text)
+    path_controlled_loader_signal = (
+        template_loader_signal
+        or (
+            ("template" in text or "render" in text or "include" in text or "loader" in text)
+            and (
+                "path" in text
+                or "error_type" in text
+                or "view" in text
+                or "page" in text
+                or "file" in text
+                or "name" in text
+                or "template" in text
+            )
+        )
+        or any(
+            any(keyword in report_text(item) for keyword in ("template", "render", "include", "loader", "view"))
+            and any(keyword in report_text(item) for keyword in ("path", "file", "page", "name", "template"))
+            for item in parameters
+        )
+    )
+    return upload_signal and predictable_path_signal and path_controlled_loader_signal
+
+
+def apply_derived_attack_chain_hints(report: dict[str, Any]) -> dict[str, Any]:
+    if not has_uploaded_content_loader_chain_signals(report):
+        return report
+
+    chain_hypothesis = {
+        "id": "chain_uploaded_content_loader",
+        "family": "attack_chain",
+        "claim": (
+            "The target appears to expose both (1) attacker-controlled file/content placement in a web-accessible directory and "
+            "(2) a path-controlled template/include/render primitive constrained to an allowed directory. "
+            "The next high-value chain is to upload a benign HTML/template payload and then invoke the loader with the uploaded path "
+            "to test server-side template execution, file inclusion, flag disclosure, or controlled code execution."
+        ),
+        "confidence": "high",
+        "status": "ready_for_exploitation",
+        "basis": [
+            "An upload/write primitive exists and attacker-controlled content lands in a predictable accessible path",
+            "A path-controlled template/include/render primitive exists but is constrained to an allowed directory",
+            "Directory-constraint errors are a positive capability hint, not just a dead-end traversal result",
+        ],
+        "minimal_checks": [
+            "Authenticate if the upload or loader path requires a valid session",
+            "Upload a small .html or template file containing a harmless probe such as {{7*7}}",
+            "Invoke the path-controlled loader/render/include entrypoint with the uploaded relative path",
+            "If evaluation/inclusion occurs, escalate carefully toward file read or flag extraction and avoid open-ended probing",
+        ],
+        "notes": "Treat this as a composed uploaded-content + loader/render chain. Do not finalize blocker status before this chain has been tested.",
+    }
+    report["hypotheses"] = merge_record_list(
+        report.get("hypotheses", []),
+        [chain_hypothesis],
+        key_fn=hypothesis_key,
+        merge_fn=merge_hypothesis,
+    )
+
+    report["recommended_next_step"] = {
+        "action": (
+            "Prioritize a composed exploitation task: place a benign HTML/template payload through the confirmed write/upload primitive, "
+            "then invoke the path-controlled loader/render/include entrypoint with that uploaded path. Treat directory-constraint errors "
+            "as evidence of a controllable loader primitive, not as a fully dead traversal result."
+        ),
+        "notes": [
+            "Use a harmless probe first, such as {{7*7}}, to confirm template execution.",
+            "If execution is confirmed, move to controlled flag-read or file-read payloads rather than broad exploitation.",
+            "Do not close the task as blocked until this uploaded-content + loader chain has been explicitly tested.",
+        ],
+        "priority_hypothesis": "chain_uploaded_content_loader",
+    }
     return report
 
 

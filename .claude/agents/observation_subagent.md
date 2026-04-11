@@ -33,6 +33,8 @@ tools: Read, mcp__sandbox__python_exec, mcp__sandbox__python_get, mcp__sandbox__
 11. 不要直接 `Read` `runtime_v2/terminals/*/outputs.jsonl`、`.claude/projects/*.jsonl`、`/home/kali/.claude/tools/*` 或 `/home/kali/workspace/.claude/tools/*`；helper 路径应当直接执行，终端日志应通过 `terminal_read` 或更小的摘要获取
 12. 当 `reports/observation_report.json` 已经变大时，不要整份反复 `Read`；优先用 `python_exec` 或 `Grep` 只提取本轮要用的 endpoint / evidence / hypothesis
 13. 不要把超过 4KB 的脚本、payload 字典、响应样本作为 `terminal_write` / `shell_exec` 输入；复杂逻辑优先放进 `python_exec`，落盘 artifact 后只打印摘要
+14. 长 `.py` / `.json` / `.md` / update payload 默认必须用 `python_exec` 生成；不要用 shell heredoc、`cat > file` 或超长 `shell_exec` 来写文件
+15. merge helper 成功后立即结束；不要为了“确认一下”再整份读取 observation 主文件、`cat` 临时 JSON、或生成额外 markdown 总结
 
 ## Terminal 预算
 
@@ -54,11 +56,14 @@ tools: Read, mcp__sandbox__python_exec, mcp__sandbox__python_get, mcp__sandbox__
   - 上下文里只保留：`path`、`status`、`content-type`、`bytes`、`sha256`、最多前 20 行摘要
 - `bootstrap`、`jquery`、minified JS/CSS 等 vendor 文件默认禁止全文回灌
 - 如果只是为了确认是否含关键词，做局部提取，不要贴全文
+- 长脚本、长 JSON、临时 merge payload 不要用 `shell_exec` 的 heredoc / `cat > file` 写入；只要超过几行，就改用 `python_exec`
+- 不要读取 `runtime_v2/shell_exec/*/outputs.jsonl`、`runtime_v2/terminals/*/outputs.jsonl` 或 helper 源码来“确认结果”；如果某条命令摘要不够，改为更窄的命令或更小的结构化提取
 
 ## 判定约束
 
 - `status>=400` 或标准 HTML 404 页面 **绝不能** 记成 “Found”
 - 这类结果只能进入 `negative_findings`
+- 但如果路径穿越/LFI 测试返回的是**有语义的约束错误**，例如“目标模板/文件位于允许目录之外”“超出模板根目录”“不在允许路径内”这类目录约束错误，这不只是 negative finding；它同时说明目标存在**模板/文件加载器**，只是受目录约束。此类信号必须作为 evidence/hypothesis 写入 observation，而不是只当作“已阻止”
 - 候选路径 / 文件 / 接口只有在你同时掌握 `request + status + content-type + 判定依据` 时，才允许记为有效发现
 - “像漏洞”只能写成 hypothesis，不能写成已确认漏洞
 
@@ -74,7 +79,10 @@ tools: Read, mcp__sandbox__python_exec, mcp__sandbox__python_get, mcp__sandbox__
   - `python /home/kali/.claude/tools/manage_observation_report.py --report /home/kali/workspace/reports/observation_report.json --update <update.json>`
 - 不要整份覆盖旧 observation 数据
 - 禁止使用 `cat > reports/observation_report.json`、`python open(..., "w")` 或任何直接覆写主文件的方式
+- update JSON 默认使用 `python_exec + json.dump(..., indent=2)` 写出，不要用 shell heredoc 直接拼接大 JSON
+- 如果本轮 evidence 已经能组合成更高价值的利用链，`recommended_next_step` 必须写成**一条可直接派单的短动作**，而不是泛泛而谈；后续 merge helper 会把它作为结构化调度信号保留下来
 - 你的临时脚本、响应样本、摘要、候选片段统一写入 `.artifacts/observation/`
+- 除非 main agent 明确要求，否则不要额外生成 `*.md` / `*.txt` 解释性总结文件
 
 ## 返回要求
 

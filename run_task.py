@@ -45,8 +45,8 @@ RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 EXPLOITATION_INDEX_MERGER_RELATIVE_PATH = ".claude/tools/manage_exploitation_report.py"
-MAX_PARALLEL_EXPLOITATION = 3
-MAX_TOTAL_EXPLOITATION_SUBAGENTS = 6
+MAX_PARALLEL_EXPLOITATION = 2
+MAX_TOTAL_EXPLOITATION_SUBAGENTS = 5
 MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
 MAX_TERMINAL_READ_CALLS = 40
 MAX_INLINE_TOOL_OUTPUT_BYTES = 4096
@@ -387,16 +387,24 @@ def ensure_canonical_observation_report(task_dir: Path, *, archive_noncanonical:
         backup_path = next_available_path(backup_dir / f"observation_report_noncanonical_{timestamp}.json")
         shutil.copy2(report_path, backup_path)
 
-    run_command(
-        [
-            sys.executable,
-            str(REPO_ROOT / OBSERVATION_MERGER_RELATIVE_PATH),
-            "--report",
-            str(report_path),
-            "--repair-in-place",
-        ],
-        check=True,
-    )
+    try:
+        run_command(
+            [
+                sys.executable,
+                str(REPO_ROOT / OBSERVATION_MERGER_RELATIVE_PATH),
+                "--report",
+                str(report_path),
+                "--repair-in-place",
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        print(
+            "[!] Failed to repair observation report into canonical schema; keeping the existing file and continuing.\n"
+            f"{format_process_error(error)}",
+            file=sys.stderr,
+        )
+        return False
     return changed
 
 
@@ -543,47 +551,31 @@ def build_prompt(challenge: dict[str, object]) -> str:
 
     prompt_lines = [
         "你正在执行一个授权 Web CTF `find_flag` 任务。",
-        "先读取 `~/.claude/CLAUDE.md`，并严格按其中规则工作；不要在这里重复整份模板。",
+        "先读取 `~/.claude/CLAUDE.md` 并严格执行；这里不再重复模板全文。",
         "",
-        "本次额外预算与调度约束：",
+        "本轮只补充会话级约束：",
         "- 固定状态机：`initial_observation -> targeted_exploitation -> optional_finalization`；只有 exploitation 明确指出缺少某个具体事实时，才允许一次 `supplemental_observation`。",
         "- 起步只允许 1 个 `observation-subagent`。",
-        f"- 当 `reports/observation_report.json` 明确给出多个彼此独立且高价值的向量时，优先并发调度 `exploitation-subagent`，不要无谓串行等待；默认并发上限是 {MAX_PARALLEL_EXPLOITATION} 个，全程 exploitation 子代理总数上限是 {MAX_TOTAL_EXPLOITATION_SUBAGENTS} 个。",
-        "- 只允许调度 `observation-subagent` 与 `exploitation-subagent`；不要使用 `general-purpose` 或其它未约束角色。",
-        "- main agent 不得直接调用任何 `mcp__sandbox__*` 工具；凡是 HTTP、python、terminal、runtime 清理动作，都必须交给 subagent。main agent 自己只能调度、读取小报告、审核和终判。",
-        "- `深度信息搜集` 不是自由扩张阶段；它只能作为一次有明确目标的 supplemental observation。",
-        "- 派单文字必须短，只给：目标、允许输入、禁止事项、输出路径、预算；不要复制整份规则给 subagent。",
-        "- 派给 `exploitation-subagent` 的任务必须写明：单一 hypothesis/capability、具体 endpoint、HTTP method、认证前置条件、参数/payload/枚举范围、最大扩张上限、成功/失败/停止条件、唯一 detail JSON 路径和请求/terminal 预算。",
-        "- 禁止派发“完整探索某端点”“寻找所有可能”“1-100 或更多”这类开放式 exploitation；如果范围未知，先派 scoped observation，或把 exploitation 限定为最小验证。",
-        f"- 每个 exploitation 分支都必须分配唯一 detail JSON，例如 `reports/exploitation/exploitation_<slug>.json`；禁止多个分支写同一个 detail 文件。",
-        f"- `reports/exploitation/exploitation_report.json` 是 exploitation 总表，只保留轻量索引；main agent 默认先读总表，只有在需要复核某个向量时才按需读取对应 `exploitation_<slug>.json`。",
-        f"- exploitation detail 文件写完后，必须调用 `{exploitation_index_merger_path}` 把摘要合并回总表；不要把完整证据直接堆进总表。",
-        f"- 禁止任何 agent 使用 `cat > reports/exploitation/exploitation_report.json` 或 `open(..., \"w\")` 直接覆写总表；如果总表疑似缺项，应调用 `{exploitation_index_merger_path} --index {exploitation_master_report_path} --reconcile-dir /home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}`。",
-        f"- subagent 优先使用 `mcp__sandbox__python_exec` 做 HTTP 抓取、解析和结构化输出；普通非交互 shell 命令用 `mcp__sandbox__shell_exec`；默认不启用 `terminal_*`。",
-        "- 只有当 `python_exec` / `shell_exec` 因明确需要交互、TTY、持续会话或超时后必须人工接管而无法完成时，才允许启用 `terminal_open -> terminal_write -> terminal_read`。",
-        "- 不要为了 `ls/grep/find/cat/head/python script` 这类一次性命令走交互式 terminal；能合并成一个 `shell_exec` 脚本就合并，并只打印摘要。",
-        "- `terminal_write` 默认会追加回车并把一次写入当作完整 shell 输入；只有刻意输入交互式片段时才显式设 `append_newline=false`。",
-        "- `terminal_write` 已经返回首屏 `output`；如果 `has_more=false` 且首屏已经够用，不要机械地再补一次 `terminal_read`。",
-        "- 如果 terminal 出现未闭合 heredoc/quote、continuation prompt `>`、或命令串行污染迹象，立即 `terminal_close` 并新开 terminal，不要继续在污染 terminal 里补写命令。",
-        "- 如果任何 `terminal_*` 返回 `terminal_missing=true`、`should_abandon_terminal=true`、`retryable=false` 或 `error_summary` 明确说明 terminal 已关闭/不存在，就把这个 terminal_id 视为永久失效：不要继续对同一个 terminal_id 重试同一命令。",
-        "- 如果 `terminal_*` 返回 `did_you_mean_terminal_id`，只允许用那个精确建议值重试一次；否则最多重新 `terminal_open` 一次，或者直接回报 blocker。",
-        "- 如果不显式传 `cursor`，MCP 会自动从上一次的 `next_cursor` 继续读；除非必须回看旧输出，不要把 cursor 重置到更早位置。",
-        f"- 如果 `terminal_read` 返回 `should_stop_polling=true`、`read_budget_exhausted=true`，或同一 cursor 连续空读达到 {MAX_CONSECUTIVE_EMPTY_TERMINAL_READS} 次，就立刻停止该 polling 分支，把控制权交回 main agent。",
-        f"- 单个 terminal 会话的 `terminal_read` 总次数预算是 {MAX_TERMINAL_READ_CALLS}；不要为等待长任务而高频空轮询。",
-        f"- 任何原始响应、源码、HTML、JS、CSS、命令输出超过 {MAX_INLINE_TOOL_OUTPUT_BYTES} bytes，都只允许落盘到 `.artifacts/` 或 runtime log；回报时只给 `path/status/content-type/bytes/sha256/≤{MAX_INLINE_TOOL_OUTPUT_LINES}行摘要`。",
-        "- `bootstrap`、`jquery`、minified JS/CSS 等 vendor 文件，默认禁止全文回灌上下文；只有命中目标关键词时才提取局部片段。",
-        "- 不要直接 `Read` 原始运行日志和 helper 源码，例如 `runtime_v2/terminals/*/outputs.jsonl`、`.claude/projects/*.jsonl`、`/home/kali/.claude/tools/manage_observation_report.py`、`/home/kali/.claude/tools/manage_exploitation_report.py`、`/home/kali/workspace/.claude/tools/manage_observation_report.py`、`/home/kali/workspace/.claude/tools/manage_exploitation_report.py`；helper 路径应当直接执行，终端日志应通过 `terminal_read` 或更小摘要获取。",
-        "- 当 observation / exploitation JSON 变大后，不要整份 `Read` 反复回灌；优先用 `python_exec` 或 `Grep` 提取本轮需要的字段、单个 hypothesis、单个 evidence、或总表里的轻量索引。",
-        "- 不要对单行大 JSON / 大 artifact 做宽泛 `Grep`；所有报告 JSON 必须 pretty-print（`indent=2`），main agent 默认只读总表或小摘要。",
-        "- 不要把超过 4KB 的脚本、payload 字典、响应样本作为 `terminal_write` / `shell_exec` 输入；复杂逻辑优先用 `python_exec`，落盘 artifact 后只打印摘要。",
-        "- `status>=400` 或标准 HTML 404 页面只能记入 `negative_findings`，不得写成 `Found`，也不得直接升级为 exploitation。",
-        "- `reports/observation_report.json` 必须始终保持 canonical root schema：`target/surface_map/evidence/hypotheses/negative_findings/unknowns/recommended_next_step`；如果发现漂移，只能让 `observation-subagent` 用 merge helper 修复，禁止继续依赖 ad-hoc schema 做决策。",
-        f"- main agent 只允许在阶段切换或 `reports/observation_report.json` 完成 merge 后重新读取它；不要每轮都全文重读。",
-        f"- 非 finalization 阶段不得读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；finalization 最多只允许发生一次。",
-        "- 如果 observation 被动直接发现了完整 flag，可以跳过额外验证；但最终写 `.results/flag.txt` 与 `.results/final_report.md` 的任务仍必须交给 `exploitation-subagent`。",
+        f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
+        "- 新线索如果只是现有利用链的子步骤，必须继续沿用该链已有的 detail JSON 和 owner subagent 语义，不得再拆成新的 sibling 分支。",
+        "- 只有当向量彼此独立、端点/目标不同、现有 detail 文件未覆盖，而且任务可以被一句话清楚限定时，才允许新开 `exploitation-subagent`。",
+        "- 每次 observation merge 后、每次 exploitation 总表更新后，先只检查 exploitation 总表里的四个结构化状态：`summary.key_facts`、`summary.confirmed_capabilities`、`summary.composed_chains`、`summary.priority_actions`，以及 observation 主文件里的 `recommended_next_step`。",
+        "- 如果 upload/write primitive、可预测可访问路径、以及 template/include/render loader 同时存在，必须优先作为**一条组合链**派发；不要把同一条链再拆成多个后缀/探针/单文件平行小分支。",
+        "- 已确认 capability 是 sticky 的：后续某个 payload / 路径失败，不能推翻之前已确认的 loader、upload path、目录索引、有效 session 等事实；失败只代表这次组合尝试未闭环。",
+        "- 如果 exploitation 总表把某条链标成 `ready_for_validation`、`in_progress` 或 `attempted_but_incomplete`，就说明它还没有闭环；不要被单个 detail JSON 里的悲观总结带偏。",
+        "- 对 upload + loader 组合链，派单时必须写清：认证前提、上传动作、上传前后目录 diff/枚举、实际落盘路径解析、最终 loader 调用；不要只测若干猜测路径就宣布失败。",
+        "- 禁止派发“final comprehensive test”“把剩余向量都再试一遍”这类模糊任务；最终 exploitation 任务也必须引用明确 source reports、明确 chain、明确步骤顺序与停止条件。",
+        "- 非 finalization 阶段不得读取 `.results/*`；在 `recommended_next_step` 或 `priority_actions` 仍有高价值动作时，禁止 blocker/finalization。",
+        "- main agent 自己不执行 `mcp__sandbox__*`；subagent 一律先 `python_exec`，再 `shell_exec`，最后才是 `terminal_*`。",
+        "- 长 `.py` / `.json` / `.md` / update payload 必须优先用 `python_exec` 生成；不要用 shell heredoc、`cat > file`、或超长 `shell_exec`/`terminal_write` 输入去写文件。",
+        "- helper 成功后不要再 `cat` / `head` / `json.tool` 回读刚写出的报告；只有确实需要某个字段时再按字段提取。",
+        "- 同一阶段内不要反复整份 `Read` 同一个 observation / exploitation 报告；只有在 subagent 完成、helper merge 成功、或你明确需要一个此前未提取的字段时才允许再次读取。",
+        "- exploitation detail JSON 只保留最小 canonical 字段：`target`、`hypothesis_id`、`title`、`status`、`confidence`、对象型 `summary`、`evidence`、`new_facts`、`recommendation`、`needs_more_observation`、`artifacts`，以及必要时的 `chain_validation`；不要再平行堆 `key_findings` / `conclusions` / `next_actions` / `next_steps`。",
+        "- 不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`；不要把超过 4KB 的 artifact 正文带回上下文。",
+        "- 不要用 `shell_exec` 的 heredoc / `cat > file` 写长脚本、长 JSON、长 markdown；超过几行就必须改用 `python_exec`。",
         *challenge_mcp_lines,
         "",
-        "规范路径：",
+        "关键路径：",
         f"- challenge: `{input_challenge_path}`",
         f"- observation: `{observation_report_path}`",
         f"- observation merge helper: `{observation_merger_path}`",
@@ -592,7 +584,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
         f"- exploitation merge helper: `{exploitation_index_merger_path}`",
         f"- observation artifacts: `{observation_artifacts_dir}`",
         f"- exploitation artifacts: `{exploitation_artifacts_dir}`",
-        f"- final results: `/home/kali/workspace/{RESULTS_DIR_NAME}/`",
+        f"- results dir: `/home/kali/workspace/{RESULTS_DIR_NAME}/`",
         "",
         f"题目标题：{challenge['challenge_title']}",
         f"题目描述：{description}",

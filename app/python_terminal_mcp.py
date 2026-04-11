@@ -40,6 +40,8 @@ DEFAULT_OUTPUT_PAGE_SIZE = 20
 DEFAULT_TOOL_OUTPUT_PAGE_BYTES = 8 * 1024
 DEFAULT_TOOL_OUTPUT_PREVIEW_LINES = 20
 DEFAULT_TOOL_OUTPUT_PREVIEW_BYTES = 4 * 1024
+DEFAULT_TOOL_COMMAND_PREVIEW_LINES = 6
+DEFAULT_TOOL_COMMAND_PREVIEW_BYTES = 384
 DEFAULT_TERMINAL_READ_WAIT_SECONDS = 1.0
 DEFAULT_MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
 DEFAULT_MAX_TERMINAL_READ_CALLS = 40
@@ -195,8 +197,6 @@ class ExecutionRecord:
                 "idle_output_exceeded": idle_for_seconds >= self.idle_output_timeout_seconds,
                 "total_output_messages": self.total_output_messages,
                 "total_output_bytes": self.total_output_bytes,
-                "output_log_path": self.output_log_path,
-                "metadata_path": self.metadata_path,
                 "auto_output_cursor": self.auto_output_cursor,
             }
 
@@ -275,8 +275,6 @@ class TerminalRecord:
                 "total_output_bytes": self.total_output_bytes,
                 "last_output_at": self.last_output_at,
                 "idle_for_seconds": round(idle_for_seconds, 3),
-                "output_log_path": self.output_log_path,
-                "metadata_path": self.metadata_path,
                 "wait_timeout_seconds": self.wait_timeout_seconds,
                 "hard_timeout_seconds": self.hard_timeout_seconds,
                 "env_overrides": dict(self.env_overrides),
@@ -385,8 +383,6 @@ class PythonTerminalExecutorV2:
             "runtime_key": record.runtime_key,
             "agent_id": record.agent_id,
             "group_id": record.group_id,
-            "output_log_path": record.output_log_path,
-            "metadata_path": record.metadata_path,
             "end_time": record.end_time,
             "return_code": record.return_code,
             "cleanup_reason": cleanup_reason,
@@ -405,14 +401,14 @@ class PythonTerminalExecutorV2:
                 return terminal_id, self.closed_terminals[terminal_id], False
             if terminal_id in self.terminals:
                 record = self.terminals[terminal_id]
-                return terminal_id, {"status": record.status, "output_log_path": record.output_log_path}, True
+                return terminal_id, {"status": record.status}, True
             matches = difflib.get_close_matches(terminal_id, active_ids + closed_ids, n=1, cutoff=0.72)
             if not matches:
                 return None, None, False
             match = matches[0]
             if match in self.terminals:
                 record = self.terminals[match]
-                return match, {"status": record.status, "output_log_path": record.output_log_path}, True
+                return match, {"status": record.status}, True
             return match, self.closed_terminals.get(match), False
 
     def _terminal_missing_page(self, terminal_id: str, *, cursor: int) -> dict[str, Any]:
@@ -446,7 +442,6 @@ class PythonTerminalExecutorV2:
             "has_more": False,
             "items": [],
             "status": tombstone.get("status") if tombstone else "missing",
-            "output_log_path": tombstone.get("output_log_path") if tombstone else None,
             "error_summary": error_summary,
             "terminal_missing": True,
             "retryable": False,
@@ -472,7 +467,6 @@ class PythonTerminalExecutorV2:
             "has_more": False,
             "items": [],
             "status": record.status,
-            "output_log_path": record.output_log_path,
             "error_summary": (
                 f"{error_summary} This terminal should be treated as unavailable; "
                 "do not keep retrying the same terminal_id."
@@ -703,7 +697,29 @@ class PythonTerminalExecutorV2:
         digest = hashlib.sha256(encoded).hexdigest()[:16]
         summary = (
             f"{preview}\n...[truncated; bytes={len(encoded)}; sha256={digest}; "
-            "see output_log_path for full content]"
+            "full content archived in runtime logs]"
+        )
+        return summary, True
+
+    def _summarize_tool_command_string(self, value: str) -> tuple[str, bool]:
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) <= DEFAULT_TOOL_COMMAND_PREVIEW_BYTES and value.count("\n") < DEFAULT_TOOL_COMMAND_PREVIEW_LINES:
+            return value, False
+
+        lines = value.splitlines()
+        if lines:
+            preview = "\n".join(lines[:DEFAULT_TOOL_COMMAND_PREVIEW_LINES])
+        else:
+            preview = value
+
+        preview_bytes = preview.encode("utf-8", errors="replace")
+        if len(preview_bytes) > DEFAULT_TOOL_COMMAND_PREVIEW_BYTES:
+            preview = preview_bytes[:DEFAULT_TOOL_COMMAND_PREVIEW_BYTES].decode("utf-8", errors="ignore")
+
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
+        summary = (
+            f"{preview}\n...[command truncated; bytes={len(encoded)}; sha256={digest}; "
+            "full command archived in shell_exec metadata]"
         )
         return summary, True
 
@@ -1312,7 +1328,6 @@ class PythonTerminalExecutorV2:
                 record.auto_output_cursor = page["next_cursor"]
         page["execution_id"] = execution_id
         page["status"] = record.status
-        page["output_log_path"] = record.output_log_path
         page["implicit_cursor_used"] = cursor is None
         return page
 
@@ -1424,6 +1439,7 @@ class PythonTerminalExecutorV2:
 
         stdout_preview, stdout_truncated = self._summarize_tool_output_string(stdout)
         stderr_preview, stderr_truncated = self._summarize_tool_output_string(stderr)
+        command_preview, command_truncated = self._summarize_tool_command_string(command)
         status = "timed_out" if timed_out else ("completed" if return_code == 0 else "failed")
         metadata = {
             "execution_id": execution_id,
@@ -1458,11 +1474,27 @@ class PythonTerminalExecutorV2:
             stderr_bytes=metadata["stderr_bytes"],
         )
         return {
-            **metadata,
+            "execution_id": execution_id,
+            "runtime_key": runtime.runtime_key,
+            "agent_id": agent_id,
+            "group_id": group_id,
+            "cwd": effective_cwd,
+            "status": status,
+            "timed_out": timed_out,
+            "return_code": return_code,
+            "start_time": start_time,
+            "end_time": end_time,
+            "timeout_seconds": timeout,
+            "command_preview": command_preview,
+            "command_bytes": len(command.encode("utf-8", errors="replace")),
+            "command_truncated": command_truncated,
             "stdout": stdout_preview,
             "stderr": stderr_preview,
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
+            "stdout_bytes": metadata["stdout_bytes"],
+            "stderr_bytes": metadata["stderr_bytes"],
+            "error_summary": error_summary,
             "recommended_next_action": (
                 "If this timed out because the command needs interactive input or TTY control, retry with terminal_*; "
                 "otherwise keep using shell_exec with a narrower command or a larger bounded timeout."
@@ -1865,7 +1897,6 @@ class PythonTerminalExecutorV2:
                     "has_more": False,
                     "items": [],
                     "status": record.status,
-                    "output_log_path": record.output_log_path,
                     "read_call_count": read_call_count,
                     "consecutive_empty_reads": record.consecutive_empty_reads,
                     "recommended_wait_seconds": None,
@@ -1906,7 +1937,6 @@ class PythonTerminalExecutorV2:
 
         page["terminal_id"] = terminal_id
         page["status"] = record.status
-        page["output_log_path"] = record.output_log_path
         page["read_call_count"] = read_call_count
         page["consecutive_empty_reads"] = consecutive_empty_reads
         page["recommended_wait_seconds"] = recommended_wait_seconds
@@ -2225,7 +2255,7 @@ if mcp is not None:
         agent_id: Annotated[str, "Required isolated agent ID."],
         command: Annotated[
             str,
-            "Run one non-interactive shell command. Prefer this over terminal_* for ordinary commands; use terminal_* only when TTY/interactive control is required.",
+            "Run one non-interactive shell command. Prefer this over terminal_* for ordinary commands; use terminal_* only when TTY/interactive control is required. Avoid large heredocs or `cat > file` patterns here—use python_exec for long scripts, JSON, or file generation.",
         ],
         group_id: Annotated[Optional[str], "Optional explicit shared runtime group ID."] = None,
         cwd: Annotated[Optional[str], "Working directory. Relative paths resolve under the runtime workspace."] = None,
