@@ -8,7 +8,8 @@
 
 - 使用 `Read` / `Grep` / `Glob` 读取规范输入、规范报告，以及被规范报告明确引用的 artifact
 - 使用 `Task` 调用 subagent（运行日志中也可能显示为 `Agent`）
-- 审核 `inputs/challenge.json`、`reports/observation_report.json`、必要时查看 `reports/observation_report_v*.json` 快照、`reports/exploitation/exploitation_report.json`、`reports/exploitation/exploitation_*.json`、`results/flag.txt`、`results/final_report.md`、`results/blocker_report.md`
+- 审核 `.inputs/challenge.json`、`reports/observation_report.json`、必要时查看 `reports/observation_report_v*.json` 快照、`reports/exploitation/exploitation_report.json`、`reports/exploitation/exploitation_*.json`
+- 仅在明确进入最终落盘阶段后，才读取 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
 - 基于证据决定下一步应该继续 observation、继续 exploitation，还是终止任务
 
 ## main agent 明确禁止做的事
@@ -19,8 +20,9 @@
 - 禁止亲自做漏洞利用
 - 禁止在证据不足时宣布漏洞成立或 flag 正确
 - 禁止猜测 flag，flag 只允许是有证据支撑的完整 `flag{...}` 原文
-- 禁止在未进入最终落盘阶段前主动读取 `results/flag.txt`、`results/final_report.md`、`results/blocker_report.md`
-- 禁止把工作区根目录或 `artifacts/` 下的临时 `*flag*.txt`、`*report*.md`、测试脚本当作规范结果
+- 禁止在未进入最终落盘阶段前主动读取或枚举 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
+- 禁止主动枚举 `.artifacts/`；除非规范报告明确引用，否则不要读取其中内容
+- 禁止把工作区根目录或 `.artifacts/` 下的临时 `*flag*.txt`、`*report*.md`、测试脚本当作规范结果
 
 ## 角色分工
 
@@ -53,7 +55,7 @@
 - 针对单个 hypothesis / capability 做最小验证
 - 在验证成立后构造受控利用
 - 写出 `reports/exploitation/exploitation_report.json` 或 main agent 指定的专属结果文件
-- 在 main agent 明确要求落盘结果时，写入 `results/flag.txt`、`results/final_report.md` 或 `results/blocker_report.md`
+- 在 main agent 明确要求落盘结果时，写入 `.results/flag.txt`、`.results/final_report.md` 或 `.results/blocker_report.md`
 - 如果验证过程中发现新的客观事实，写入 exploitation 报告并交由 main agent 决定是否回流到 observation
 
 不负责：
@@ -64,7 +66,7 @@
 
 ## 强制工作流
 
-1. 先读取 `inputs/challenge.json` 与规范报告文件，不要先扫描整个工作区
+1. 先读取 `.inputs/challenge.json` 与规范报告文件，不要先扫描整个工作区，也不要枚举 `.artifacts/` 或 `.results/`
 2. **必须先调用 `observation-subagent`**
 3. `reports/observation_report.json` 是唯一默认的 observation 主文件；如果需要补充 observation，默认维护并增量更新这个主文件
 4. 只有在 main agent 明确要求保留审计快照时，才额外生成 `reports/observation_report_v2.json`、`reports/observation_report_v3.json` 等快照文件；工作集仍以 `reports/observation_report.json` 为准
@@ -81,7 +83,7 @@
 - 例如，不得要求它去做：SSRF 目标替换、SQLi payload、SSTI 表达式、XSS payload、命令注入 payload、路径穿越 payload、认证绕过尝试、对象 ID 切换验证
 - 如果 observation 阶段发现“像漏洞”的线索，只能记录为 hypothesis，并把验证动作留给 `exploitation-subagent`
 - 如果 observation 在允许的动作中被动直接看到了完整 flag，可以把该事实写入 `reports/observation_report.json` 并立即通知 main agent，但不得为了拿 flag 主动升级为利用
-- observation 阶段的临时脚本、样本、候选片段统一放在 `artifacts/observation/`
+- observation 阶段的临时脚本、样本、候选片段统一放在 `.artifacts/observation/`
 
 ## 并行利用策略
 
@@ -109,10 +111,10 @@
 
 - 禁止多个 `exploitation-subagent` 写入同一个报告文件
 - 并行阶段不要让多个 subagent 同时写 `reports/exploitation/exploitation_report.json`
-- 并行阶段默认不要让多个 subagent 同时写 `results/flag.txt`、`results/final_report.md`、`results/blocker_report.md`
+- 并行阶段默认不要让多个 subagent 同时写 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
 - 并行阶段每个 subagent 只写自己专属的结果文件，例如 `reports/exploitation/exploitation_<vector>.json`
 - 等并行 exploitation 全部完成后，由 main agent 审核结果，再决定是否额外派发一个“最终落盘”任务来写共享结果文件
-- exploitation 阶段的脚本、请求样本、下载文件、候选 flag、PoC 产物统一放在 `artifacts/exploitation/<vector>/`
+- exploitation 阶段的脚本、请求样本、下载文件、候选 flag、PoC 产物统一放在 `.artifacts/exploitation/<vector>/`
 
 ## 报告文件防覆盖规则
 
@@ -137,7 +139,7 @@
   - `reports/exploitation/exploitation_report_v2.json`
   - `reports/exploitation/exploitation_report_v3.json`
 - `status` 应保留在 JSON 内容里，不要放进主文件名
-- `inputs/`、`reports/`、`results/` 之外的内容默认都是 artifact；除非被规范报告明确引用，否则不要把它们当作最终结论依据
+- `.inputs/`、`reports/`、`.results/` 之外的内容默认都是 artifact；除非被规范报告明确引用，否则不要把它们当作最终结论依据
 
 ## 证据与反幻觉约束
 

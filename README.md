@@ -41,7 +41,7 @@ ccctfer/
 - `CHALLENGE_TITLE`
 - `CHALLENGE_DESCRIPTION`
 - `CHALLENGE_HINT`
-- `AGENT_TOKEN`
+- `AGENT_TOKEN`：对应请求中的 `Agent-Token` 值，适合固定写入 `.env`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_AUTH_TOKEN`
 - `ANTHROPIC_MODEL`
@@ -68,6 +68,7 @@ docker build -t ccctfer-mcp:latest .
 ```bash
 CHALLENGE_ENTRYPOINT=http://127.0.0.1:8080
 SERVER_HOST=127.0.0.1:8080
+AGENT_TOKEN=your-agent-token
 CHALLENGE_CODE=demo
 CHALLENGE_TITLE=Demo CTF
 CHALLENGE_DESCRIPTION=Demo description
@@ -97,7 +98,7 @@ python3 run_task.py \
 ## 运行机制（简版）
 
 1. `run_task.py` 创建任务目录：`workspace/<timestamp>-<slug>/`
-2. 写入输入与目录骨架（`inputs/`、`reports/`、`artifacts/`、`results/`）
+2. 写入输入与目录骨架（`.inputs/`、`reports/`、`.artifacts/`、`.results/`）
 3. 将任务目录挂载到容器 `/home/kali/workspace`
 4. 容器内启动 `python_terminal_mcp.py`（监听 `0.0.0.0:8000`）
 5. 等待 `http://127.0.0.1:8000/mcp` 就绪后执行 `claude`
@@ -109,16 +110,16 @@ python3 run_task.py \
 
 ```text
 workspace/0411-120000-demo/
-├── inputs/
+├── .inputs/
 │   └── challenge.json
 ├── reports/
 │   ├── observation_report.json
 │   └── exploitation/
 │       └── exploitation_report.json (或 exploitation_*.json)
-├── artifacts/
+├── .artifacts/
 │   ├── observation/
 │   └── exploitation/
-├── results/
+├── .results/
 │   ├── flag.txt
 │   ├── final_report.md
 │   └── blocker_report.md
@@ -165,4 +166,3 @@ docker logs <container_name>
 - 仅在授权场景下使用
 - 不要将真实密钥提交到仓库
 - 建议将 `.env` 保持在 `.gitignore` 中
-

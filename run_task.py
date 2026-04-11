@@ -319,8 +319,7 @@ def sanitize_task_workspace(task_dir: Path) -> None:
         "runtime_v2",
         "token_usage.txt",
     }
-    misc_dir = task_dir / ARTIFACTS_DIR_NAME / "misc"
-    misc_dir.mkdir(parents=True, exist_ok=True)
+    misc_dir: Path | None = None
 
     for child in task_dir.iterdir():
         if child.name in allowed_roots:
@@ -331,6 +330,9 @@ def sanitize_task_workspace(task_dir: Path) -> None:
             child.rmdir()
             continue
 
+        if misc_dir is None:
+            misc_dir = task_dir / ARTIFACTS_DIR_NAME / "misc"
+            misc_dir.mkdir(parents=True, exist_ok=True)
         target = next_available_path(misc_dir / child.name)
         shutil.move(str(child), str(target))
 
@@ -407,9 +409,10 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 如果证据不足，请明确说明“未找到 flag / 当前阻塞原因”，不要编造结论。
 - 不要扫描无关 IP、无关端口、无关域名；仅允许围绕题目提供的 entrypoint、同源重定向和解题必需的直接关联资源行动。
 - 固定只使用这些规范路径：题目信息在 `{input_challenge_path}`，observation 主文件在 `{observation_report_path}`，exploitation 结果默认在 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/`，最终结果只能写入 `/home/kali/workspace/{RESULTS_DIR_NAME}/`。
-- 除非某份规范报告明确引用某个 artifact 路径，否则不要主动扫描 `/home/kali/workspace/{ARTIFACTS_DIR_NAME}/` 下的临时文件。
-- 任何位于工作区根目录或 `artifacts/` 下的 `*flag*.txt`、`*report*.md`、`test_*.txt`、临时脚本、样例文件，都不是规范结果文件；不要把它们当作可信输入。
+- 除非某份规范报告明确引用某个 artifact 路径，否则不要主动扫描 `/home/kali/workspace/{ARTIFACTS_DIR_NAME}/` 下的临时文件，也不要用 `Glob` / `Grep` 枚举它。
+- 任何位于工作区根目录或 `{ARTIFACTS_DIR_NAME}/` 下的 `*flag*.txt`、`*report*.md`、`test_*.txt`、临时脚本、样例文件，都不是规范结果文件；不要把它们当作可信输入。
 - 在最终落盘前，不要主动读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；这些路径只有在你明确派发“最终落盘”任务后才应出现有效内容。
+- 在最终落盘前，不要用 `Glob` / `Grep` 枚举 `/home/kali/workspace/{RESULTS_DIR_NAME}/`；如果当前没有最终落盘任务，就把这个目录视为不可触碰。
 
 角色分工必须保持清晰：
 - `observation-subagent`：唯一可以做大规模信息搜集、攻击面梳理、线索提取的执行者。
@@ -421,7 +424,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 已验证假设、已验证能力、利用结论默认保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`；是否把新的客观事实回流到 `{observation_report_path}`，只能由你决定。
 
 强制工作流：
-1. 读取 `~/.claude/CLAUDE.md`、`{input_challenge_path}`，以及当前已经存在的规范报告文件；不要一开始就扫描整个工作区。
+1. 读取 `~/.claude/CLAUDE.md`、`{input_challenge_path}`，以及当前已经存在的规范报告文件；不要一开始就扫描整个工作区，也不要枚举 `{ARTIFACTS_DIR_NAME}` 或 `{RESULTS_DIR_NAME}`。
 2. 必须先调用 `observation-subagent` 生成并维护 `{observation_report_path}`。
 3. `{observation_report_path}` 是默认且唯一的 observation 主文件；不要为了常规补充 observation 而制造多个工作文件。
 4. 只有在你明确需要保留审计快照时，才额外要求生成 `/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v2.json`、`/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v3.json` 等快照；工作集仍以 `{observation_report_path}` 为准。
@@ -594,7 +597,7 @@ port="${PYTHON_TERMINAL_MCP_PORT:-8000}"
 python_bin="${PYTHON_TERMINAL_MCP_PYTHON:-${app_home}/.venv/bin/python}"
 
 mkdir -p "${workspace}" "${runtime_dir}" "${workspace}/.claude"
-mkdir -p "${workspace}/inputs" "${workspace}/artifacts/observation" "${workspace}/artifacts/exploitation" "${workspace}/results"
+mkdir -p "${workspace}/.inputs" "${workspace}/.artifacts/observation" "${workspace}/.artifacts/exploitation" "${workspace}/.results"
 mkdir -p "${workspace}/reports/exploitation"
 rm -rf "${HOME}/.claude"
 ln -s "${workspace}/.claude" "${HOME}/.claude"
@@ -741,6 +744,8 @@ def main() -> int:
             archive_claude_home(container_name)
         print("[+] Cleaning up container...")
         stop_container(container_name)
+        print("[+] Normalizing workspace layout...")
+        sanitize_task_workspace(task_dir)
         print(f"[+] Minimal artifacts kept under: {task_dir}")
 
 

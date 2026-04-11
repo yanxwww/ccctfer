@@ -1,4 +1,4 @@
-FROM issyy/xbow-kail
+FROM issyy/ccctfer:latest
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
