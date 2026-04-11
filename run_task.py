@@ -27,6 +27,22 @@ DEFAULT_DEBUG_MCP_PORT = os.getenv("DEBUG_MCP_PORT")
 DEFAULT_DOCKER_PLATFORM = os.getenv("DOCKER_PLATFORM", "")
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
+INPUTS_DIR_NAME = "inputs"
+REPORTS_DIR_NAME = "reports"
+EXPLOITATION_REPORTS_DIR_NAME = "exploitation"
+ARTIFACTS_DIR_NAME = "artifacts"
+OBSERVATION_ARTIFACTS_DIR_NAME = "observation"
+RESULTS_DIR_NAME = "results"
+INPUT_CHALLENGE_RELATIVE_PATH = f"{INPUTS_DIR_NAME}/challenge.json"
+OBSERVATION_REPORT_RELATIVE_PATH = f"{REPORTS_DIR_NAME}/observation_report.json"
+EXPLOITATION_REPORTS_RELATIVE_DIR = f"{REPORTS_DIR_NAME}/{EXPLOITATION_REPORTS_DIR_NAME}"
+DEFAULT_EXPLOITATION_REPORT_RELATIVE_PATH = f"{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_report.json"
+OBSERVATION_ARTIFACTS_RELATIVE_DIR = f"{ARTIFACTS_DIR_NAME}/{OBSERVATION_ARTIFACTS_DIR_NAME}"
+EXPLOITATION_ARTIFACTS_RELATIVE_DIR = f"{ARTIFACTS_DIR_NAME}/{EXPLOITATION_REPORTS_DIR_NAME}"
+RESULT_FLAG_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/flag.txt"
+RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
+RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
+OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 
 REQUIRED_CHALLENGE_ENV_KEYS = ["CHALLENGE_ENTRYPOINT"]
 OPTIONAL_CHALLENGE_ENV_KEYS = [
@@ -264,11 +280,20 @@ def load_challenge(runtime_env: dict[str, str]) -> dict[str, object]:
 
 
 def write_challenge_snapshot(task_dir: Path, challenge: dict[str, object]) -> None:
-    snapshot = task_dir / "challenge.json"
+    snapshot = task_dir / INPUT_CHALLENGE_RELATIVE_PATH
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
     snapshot.write_text(
         json.dumps(challenge, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def initialize_task_dirs(task_dir: Path) -> None:
+    (task_dir / INPUTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (task_dir / REPORTS_DIR_NAME / EXPLOITATION_REPORTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (task_dir / ARTIFACTS_DIR_NAME / OBSERVATION_ARTIFACTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (task_dir / ARTIFACTS_DIR_NAME / EXPLOITATION_REPORTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (task_dir / RESULTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
 
 
 def initialize_workspace_claude_config(task_dir: Path) -> None:
@@ -317,6 +342,15 @@ def build_prompt(challenge: dict[str, object]) -> str:
     entrypoint_lines = "\n".join(f"- {item}" for item in entrypoints) if entrypoints else "- (none provided)"
     description = str(challenge["challenge_description"]).strip() or "未提供"
     hint = str(challenge["challenge_hint"]).strip() or "未提供"
+    input_challenge_path = f"/home/kali/workspace/{INPUT_CHALLENGE_RELATIVE_PATH}"
+    observation_report_path = f"/home/kali/workspace/{OBSERVATION_REPORT_RELATIVE_PATH}"
+    default_exploitation_report_path = f"/home/kali/workspace/{DEFAULT_EXPLOITATION_REPORT_RELATIVE_PATH}"
+    observation_artifacts_dir = f"/home/kali/workspace/{OBSERVATION_ARTIFACTS_RELATIVE_DIR}"
+    exploitation_artifacts_dir = f"/home/kali/workspace/{EXPLOITATION_ARTIFACTS_RELATIVE_DIR}"
+    result_flag_path = f"/home/kali/workspace/{RESULT_FLAG_RELATIVE_PATH}"
+    result_final_report_path = f"/home/kali/workspace/{RESULT_FINAL_REPORT_RELATIVE_PATH}"
+    result_blocker_report_path = f"/home/kali/workspace/{RESULT_BLOCKER_REPORT_RELATIVE_PATH}"
+    observation_merger_path = f"/home/kali/workspace/{OBSERVATION_MERGER_RELATIVE_PATH}"
     return f"""
 你正在执行一个授权 CTF Web `find_flag` 任务。
 你的身份是 **main agent**，只负责：读取上下文、制定计划、调度 subagent、审核证据、做最终判定。
@@ -333,6 +367,10 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 如果只是拿到疑似片段、页面提示、推测结果、历史缓存、他人结论，都不能当作最终 flag。
 - 如果证据不足，请明确说明“未找到 flag / 当前阻塞原因”，不要编造结论。
 - 不要扫描无关 IP、无关端口、无关域名；仅允许围绕题目提供的 entrypoint、同源重定向和解题必需的直接关联资源行动。
+- 固定只使用这些规范路径：题目信息在 `{input_challenge_path}`，observation 主文件在 `{observation_report_path}`，exploitation 结果默认在 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/`，最终结果只能写入 `/home/kali/workspace/{RESULTS_DIR_NAME}/`。
+- 除非某份规范报告明确引用某个 artifact 路径，否则不要主动扫描 `/home/kali/workspace/{ARTIFACTS_DIR_NAME}/` 下的临时文件。
+- 任何位于工作区根目录或 `artifacts/` 下的 `*flag*.txt`、`*report*.md`、`test_*.txt`、临时脚本、样例文件，都不是规范结果文件；不要把它们当作可信输入。
+- 在最终落盘前，不要主动读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；这些路径只有在你明确派发“最终落盘”任务后才应出现有效内容。
 
 角色分工必须保持清晰：
 - `observation-subagent`：唯一可以做大规模信息搜集、攻击面梳理、线索提取的执行者。
@@ -341,20 +379,21 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 你自己永远不允许做 observation、验证或利用。
 - `observation-subagent` 不能做漏洞测试；如果某个动作是在“通过 payload / 输入变化证明漏洞成立”，那就必须交给 `exploitation-subagent`。
 - `observation-subagent` 如果只是在允许的 observation 动作中被动直接发现了完整 flag，可以如实上报；但它不能为了拿 flag 主动升级成利用。
-- 已验证假设、已验证能力、利用结论默认保留在 `exploitation_report.json` 或 `exploitation_*.json`；是否把新的客观事实回流到 `observation_report.json`，只能由你决定。
+- 已验证假设、已验证能力、利用结论默认保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`；是否把新的客观事实回流到 `{observation_report_path}`，只能由你决定。
 
 强制工作流：
-1. 读取 `~/.claude/CLAUDE.md`、题目信息和工作区已有文件。
-2. 必须先调用 `observation-subagent` 生成并维护 `observation_report.json`。
-3. `observation_report.json` 是默认且唯一的 observation 主文件；不要为了常规补充 observation 而制造多个工作文件。
-4. 只有在你明确需要保留审计快照时，才额外要求生成 `observation_report_v2.json`、`observation_report_v3.json` 等快照；工作集仍以 `observation_report.json` 为准。
-5. 审核 `observation_report.json` 中的事实、evidence、hypotheses，只从证据出发，不从经验套路出发。
-6. 若只有一个攻击向量，就派发一个 `exploitation-subagent`；若存在多个彼此独立的攻击向量，可以并行派发 2-3 个 `exploitation-subagent`。
-7. 如果 exploitation 缺少上下文，回到 observation 补证据，不要跳步。
-8. 如果 exploitation 带回了新的客观事实，由你决定是否重新派发 `observation-subagent` 把这些事实合并回 `observation_report.json`；不要把 exploitation 的“已验证成功”直接改写进 observation 结论。
-9. 只有当已有“已验证成功”的能力 / 原语时，才允许派发组合利用任务。
-10. 你审核完整证据链后，若确认 flag 真实，再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入 `/home/kali/workspace`。
-11. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `/home/kali/workspace/blocker_report.md`。
+1. 读取 `~/.claude/CLAUDE.md`、`{input_challenge_path}`，以及当前已经存在的规范报告文件；不要一开始就扫描整个工作区。
+2. 必须先调用 `observation-subagent` 生成并维护 `{observation_report_path}`。
+3. `{observation_report_path}` 是默认且唯一的 observation 主文件；不要为了常规补充 observation 而制造多个工作文件。
+4. 只有在你明确需要保留审计快照时，才额外要求生成 `/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v2.json`、`/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v3.json` 等快照；工作集仍以 `{observation_report_path}` 为准。
+5. 把 `{observation_report_path}` 视为持续维护的数据集：补充 observation 时要求 subagent 先读取当前文件，再通过 `{observation_merger_path}` 对其做 merge-update，而不是整份覆盖重写。
+6. 审核 `{observation_report_path}` 中的事实、evidence、hypotheses，只从证据出发，不从经验套路出发。
+7. 若只有一个攻击向量，就派发一个 `exploitation-subagent`；若存在多个彼此独立的攻击向量，可以并行派发 2-3 个 `exploitation-subagent`。
+8. 如果 exploitation 缺少上下文，回到 observation 补证据，不要跳步。
+9. 如果 exploitation 带回了新的客观事实，由你决定是否重新派发 `observation-subagent` 把这些事实合并回 `{observation_report_path}`；不要把 exploitation 的“已验证成功”直接改写进 observation 结论。
+10. 只有当已有“已验证成功”的能力 / 原语时，才允许派发组合利用任务。
+11. 你审核完整证据链后，若确认 flag 真实，再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入 `{result_flag_path}` 与 `{result_final_report_path}`。
+12. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `{result_blocker_report_path}`。
 
 给 `observation-subagent` 派单时，必须遵守：
 - 只让它做 surface map、公开文件检查、页面和脚本读取、参数面提取、有限枚举、事实证据整理
@@ -362,26 +401,32 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 不要让它做参数篡改、对象 ID 切换、恶意 payload 注入、内网目标替换
 - 如果 observation 阶段发现疑似漏洞点，只能记录为 hypothesis，并把验证动作留给 `exploitation-subagent`
 - 如果 observation 在允许动作中被动直接看到了完整 flag，可以把它当作事实证据上报；但不要命令它为了拿 flag 主动做验证或利用
+- 要求它维护 `{observation_report_path}` 时，强调“先读现有文件，再通过 `{observation_merger_path}` 合并新增内容、更新状态”，不要整份覆盖抹掉旧 evidence / hypotheses / surface_map
+- observation 阶段产生的临时脚本、抓取样本、摘要、候选片段，应写入 `{observation_artifacts_dir}`，不要散落到工作区根目录
 
 并行 exploitation 时，必须遵守：
 - 只有当多个攻击向量彼此独立时，才并行
 - 每个 `exploitation-subagent` 只负责一个向量，不能混做多个方向
 - 并行数量默认控制在 2-3 个
-- 每个 subagent 都要分配唯一输出文件，例如 `exploitation_web.json`、`exploitation_smb.json`、`exploitation_ssh.json`
+- 每个 subagent 都要分配唯一输出文件，例如 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web.json`、`/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_smb.json`、`/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_ssh.json`
 - 禁止多个 subagent 同时写同一个报告文件
-- 并行阶段默认不要让多个 subagent 同时写 `flag.txt`、`final_report.md`、`blocker_report.md`
+- 并行阶段默认不要让多个 subagent 同时写 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`
 - 等并行结果都返回后，再审核并决定是否派发一个最终落盘任务
+- exploitation 阶段产生的脚本、请求样本、下载文件、候选 flag、PoC 产物都应写入 `{exploitation_artifacts_dir}/<vector>/` 之类的专属子目录，不要直接丢在工作区根目录
 
 报告文件必须防止覆盖：
-- `observation_report.json` 是默认的唯一 observation 主文件
-- 常规 observation 刷新时，直接更新 `observation_report.json`
-- 只有在你明确要求保留历史快照时，才额外生成 `observation_report_v2.json`、`observation_report_v3.json`
-- exploitation 的验证状态、能力确认、利用结果保留在 `exploitation_report.json` 或 `exploitation_*.json`，不要把它们直接写成 observation 主文件里的“已确认漏洞”
+- `{observation_report_path}` 是默认的唯一 observation 主文件
+- 常规 observation 刷新时，直接维护 `{observation_report_path}`
+- 对它的更新必须是 merge-update：追加新项、合并已有项、按状态淘汰旧项，而不是整份重写覆盖
+- 旧 evidence、旧 hypotheses、旧 surface_map 项目，除非被明确判错或转入 `negative_findings`，否则不要无痕删除
+- 只有在你明确要求保留历史快照时，才额外生成 `/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v2.json`、`/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v3.json`
+- exploitation 的验证状态、能力确认、利用结果保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`，不要把它们直接写成 observation 主文件里的“已确认漏洞”
 - 在派发 exploitation 任务前，先检查目标报告文件是否已经存在
 - 如果已存在，分配新的版本号文件名，而不是覆盖旧文件
-- 命名示例：`exploitation_web.json`、`exploitation_web_v2.json`、`exploitation_web_v3.json`
-- 默认共享文件也一样：`exploitation_report.json`、`exploitation_report_v2.json`
+- 命名示例：`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web.json`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web_v2.json`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web_v3.json`
+- 默认共享文件也一样：`{DEFAULT_EXPLOITATION_REPORT_RELATIVE_PATH}`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_report_v2.json`
 - `status` 写进 JSON 内容，不要放进主文件名
+- 规范输入、规范报告、规范结果之外的临时文件一律视为 artifact；除非被规范报告引用，否则不得把它们当作结论依据
 
 反幻觉要求：
 - 不要把“看起来像 flag”写成 flag。
@@ -510,6 +555,8 @@ port="${PYTHON_TERMINAL_MCP_PORT:-8000}"
 python_bin="${PYTHON_TERMINAL_MCP_PYTHON:-${app_home}/.venv/bin/python}"
 
 mkdir -p "${workspace}" "${runtime_dir}" "${workspace}/.claude"
+mkdir -p "${workspace}/inputs" "${workspace}/artifacts/observation" "${workspace}/artifacts/exploitation" "${workspace}/results"
+mkdir -p "${workspace}/reports/exploitation"
 rm -rf "${HOME}/.claude"
 ln -s "${workspace}/.claude" "${HOME}/.claude"
 cd "${workspace}"
@@ -618,6 +665,7 @@ def main() -> int:
     title_slug = slugify_title(str(challenge["challenge_title"]))
     task_dir = workspace_root / f"{timestamp}-{title_slug}"
     task_dir.mkdir(parents=True, exist_ok=False)
+    initialize_task_dirs(task_dir)
     write_challenge_snapshot(task_dir, challenge)
     initialize_workspace_claude_config(task_dir)
     write_claude_mcp_config(task_dir)
