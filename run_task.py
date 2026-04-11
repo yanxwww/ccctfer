@@ -27,12 +27,12 @@ DEFAULT_DEBUG_MCP_PORT = os.getenv("DEBUG_MCP_PORT")
 DEFAULT_DOCKER_PLATFORM = os.getenv("DOCKER_PLATFORM", "")
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
-INPUTS_DIR_NAME = "inputs"
+INPUTS_DIR_NAME = ".inputs"
 REPORTS_DIR_NAME = "reports"
 EXPLOITATION_REPORTS_DIR_NAME = "exploitation"
-ARTIFACTS_DIR_NAME = "artifacts"
+ARTIFACTS_DIR_NAME = ".artifacts"
 OBSERVATION_ARTIFACTS_DIR_NAME = "observation"
-RESULTS_DIR_NAME = "results"
+RESULTS_DIR_NAME = ".results"
 INPUT_CHALLENGE_RELATIVE_PATH = f"{INPUTS_DIR_NAME}/challenge.json"
 OBSERVATION_REPORT_RELATIVE_PATH = f"{REPORTS_DIR_NAME}/observation_report.json"
 EXPLOITATION_REPORTS_RELATIVE_DIR = f"{REPORTS_DIR_NAME}/{EXPLOITATION_REPORTS_DIR_NAME}"
@@ -294,6 +294,45 @@ def initialize_task_dirs(task_dir: Path) -> None:
     (task_dir / ARTIFACTS_DIR_NAME / OBSERVATION_ARTIFACTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
     (task_dir / ARTIFACTS_DIR_NAME / EXPLOITATION_REPORTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
     (task_dir / RESULTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    counter = 2
+    while True:
+        candidate = path.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def sanitize_task_workspace(task_dir: Path) -> None:
+    allowed_roots = {
+        ".claude",
+        INPUTS_DIR_NAME,
+        REPORTS_DIR_NAME,
+        ARTIFACTS_DIR_NAME,
+        RESULTS_DIR_NAME,
+        "runtime_v2",
+        "token_usage.txt",
+    }
+    misc_dir = task_dir / ARTIFACTS_DIR_NAME / "misc"
+    misc_dir.mkdir(parents=True, exist_ok=True)
+
+    for child in task_dir.iterdir():
+        if child.name in allowed_roots:
+            continue
+        if child.name.startswith(".") and child.name not in {".DS_Store"}:
+            continue
+        if child.is_dir() and not any(child.iterdir()):
+            child.rmdir()
+            continue
+
+        target = next_available_path(misc_dir / child.name)
+        shutil.move(str(child), str(target))
 
 
 def initialize_workspace_claude_config(task_dir: Path) -> None:
