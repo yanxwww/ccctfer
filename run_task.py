@@ -14,7 +14,7 @@ import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -27,6 +27,7 @@ DEFAULT_DEBUG_MCP_PORT = os.getenv("DEBUG_MCP_PORT")
 DEFAULT_DOCKER_PLATFORM = os.getenv("DOCKER_PLATFORM", "")
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
+PLATFORM_MCP_AUTH_MODE_ENV = "PLATFORM_MCP_AUTH_MODE"
 INPUTS_DIR_NAME = ".inputs"
 REPORTS_DIR_NAME = "reports"
 EXPLOITATION_REPORTS_DIR_NAME = "exploitation"
@@ -203,6 +204,31 @@ def default_title_from_entrypoint(entrypoints: list[str], server_host: str) -> s
     return candidate
 
 
+def normalize_platform_server_base_url(server_host: str) -> str:
+    candidate = server_host.strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", candidate):
+        candidate = f"http://{candidate}"
+
+    parsed = urlsplit(candidate)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/api"):
+        path = path[:-4]
+    elif path.endswith("/mcp"):
+        path = path[:-4]
+    normalized = parsed._replace(path=path.rstrip("/"), query="", fragment="")
+    return urlunsplit(normalized).rstrip("/")
+
+
+def normalize_platform_auth_mode(value: str | None) -> str:
+    normalized = (value or "bearer").strip().lower().replace("_", "-")
+    if normalized not in {"bearer", "agent-token"}:
+        raise SystemExit(
+            f"Unsupported {PLATFORM_MCP_AUTH_MODE_ENV} value: {value!r}. "
+            "Use 'bearer' or 'agent-token'."
+        )
+    return normalized
+
+
 def docker_name(value: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value)
     safe = safe.strip("-.")
@@ -258,22 +284,34 @@ def load_challenge(runtime_env: dict[str, str]) -> dict[str, object]:
     if not entrypoints:
         raise SystemExit("CHALLENGE_ENTRYPOINT did not contain any usable entrypoints.")
 
-    raw_server_host = get_runtime_value(runtime_env, "SERVER_HOST") or entrypoints[0]
+    target_host = entrypoints[0]
+    platform_server_host = get_runtime_value(runtime_env, "SERVER_HOST") or ""
+    agent_token = get_runtime_value(runtime_env, "AGENT_TOKEN")
+    raw_challenge_code = get_runtime_value(runtime_env, "CHALLENGE_CODE")
+    platform_tools_enabled = bool(platform_server_host and agent_token and raw_challenge_code)
     challenge_title = maybe_decode_text(get_runtime_value(runtime_env, "CHALLENGE_TITLE"))
     if not challenge_title:
-        challenge_title = default_title_from_entrypoint(entrypoints, raw_server_host)
+        challenge_title = default_title_from_entrypoint(entrypoints, target_host)
 
-    challenge_code = get_runtime_value(runtime_env, "CHALLENGE_CODE") or slugify_title(challenge_title)
+    challenge_code = raw_challenge_code or slugify_title(challenge_title)
     challenge_description = maybe_decode_text(get_runtime_value(runtime_env, "CHALLENGE_DESCRIPTION"))
     challenge_hint = maybe_decode_text(get_runtime_value(runtime_env, "CHALLENGE_HINT"))
     challenge = {
-        "server_host": raw_server_host,
+        "server_host": target_host,
+        "target_host": target_host,
+        "platform_server_host": platform_server_host,
         "challenge_code": challenge_code,
         "challenge_entrypoints": entrypoints,
         "challenge_title": challenge_title,
         "challenge_description": challenge_description,
         "challenge_hint": challenge_hint,
-        "has_agent_token": bool(get_runtime_value(runtime_env, "AGENT_TOKEN")),
+        "has_agent_token": bool(agent_token),
+        "platform_tools_enabled": platform_tools_enabled,
+        "platform_auth_mode": (
+            normalize_platform_auth_mode(get_runtime_value(runtime_env, PLATFORM_MCP_AUTH_MODE_ENV))
+            if platform_tools_enabled
+            else ""
+        ),
         "created_at": datetime.now().isoformat(),
     }
     return challenge
@@ -357,22 +395,43 @@ def initialize_workspace_claude_config(task_dir: Path) -> None:
     (claude_dir / "agents").mkdir(parents=True, exist_ok=True)
 
 
-def write_claude_mcp_config(task_dir: Path) -> Path:
+def build_platform_mcp_server(runtime_env: dict[str, str], challenge: dict[str, object]) -> dict[str, object] | None:
+    platform_server_host = str(challenge.get("platform_server_host") or "").strip()
+    agent_token = get_runtime_value(runtime_env, "AGENT_TOKEN")
+    raw_challenge_code = get_runtime_value(runtime_env, "CHALLENGE_CODE")
+    if not (platform_server_host and agent_token and raw_challenge_code):
+        return None
+
+    auth_mode = normalize_platform_auth_mode(get_runtime_value(runtime_env, PLATFORM_MCP_AUTH_MODE_ENV))
+    headers = (
+        {"Authorization": f"Bearer {agent_token}"}
+        if auth_mode == "bearer"
+        else {"Agent-Token": agent_token}
+    )
+    return {
+        "type": "http",
+        "url": f"{normalize_platform_server_base_url(platform_server_host)}/mcp",
+        "headers": headers,
+    }
+
+
+def write_claude_mcp_config(task_dir: Path, runtime_env: dict[str, str], challenge: dict[str, object]) -> Path:
     config_path = task_dir / ".claude" / CLAUDE_MCP_CONFIG_NAME
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    config = {
+        "mcpServers": {
+            "sandbox": {
+                "type": "http",
+                "url": "http://127.0.0.1:8000/mcp",
+            }
+        }
+    }
+    platform_server = build_platform_mcp_server(runtime_env, challenge)
+    if platform_server:
+        config["mcpServers"]["platform"] = platform_server
+
     config_path.write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "sandbox": {
-                        "type": "http",
-                        "url": "http://127.0.0.1:8000/mcp",
-                    }
-                }
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(config, indent=2) + "\n",
         encoding="utf-8",
     )
     return config_path
@@ -392,6 +451,33 @@ def build_prompt(challenge: dict[str, object]) -> str:
     result_final_report_path = f"/home/kali/workspace/{RESULT_FINAL_REPORT_RELATIVE_PATH}"
     result_blocker_report_path = f"/home/kali/workspace/{RESULT_BLOCKER_REPORT_RELATIVE_PATH}"
     observation_merger_path = f"/home/kali/workspace/{OBSERVATION_MERGER_RELATIVE_PATH}"
+    platform_tools_enabled = bool(challenge.get("platform_tools_enabled"))
+    main_tools_text = "`Task`（运行日志中也可能显示为 `Agent`）、`Read`、`Grep`、`Glob`"
+    if platform_tools_enabled:
+        main_tools_text += "，以及 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`"
+    platform_rules = f"""
+- 比赛平台工具只对你这个 main agent 开放；禁止把 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge` 下放给任何 subagent。
+- 只有当 exploitation 带回了完整、可复核、来源明确的候选 `flag{{...}}` 后，你才可以亲自调用 `mcp__platform__submit_flag`。
+- 只有 `mcp__platform__submit_flag` 返回 `correct=true`，才允许认定“官方判定成功”；本地 `flag.txt`、`final_report.md`、候选片段、测试文件都不是官方成功信号。
+- 如果题目存在多个 flag，只有当平台返回的 `flag_got_count == flag_count` 时，才允许把整道题判定为完成；否则继续当前题目，不要提前收工。
+- `mcp__platform__view_hint` 只允许在你明确判定“当前题目已阻塞”后调用；不要让 subagent 决定是否看提示。
+- `mcp__platform__stop_challenge` 只允许在任务结束、明确放弃或已经官方判定成功后调用。
+""".strip()
+    platform_workflow_steps = f"""
+11. 如果 exploitation 带回了候选完整 flag，你必须亲自调用 `mcp__platform__submit_flag` 做官方判定。
+12. 只有平台确认正确后，你才可以认定成功，并再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入结果目录。
+13. 如果平台返回不正确，必须继续当前题目的证据驱动分析，不能把候选 flag 当作成功。
+14. 如果你明确判定当前题目已阻塞，才可以亲自调用 `mcp__platform__view_hint`；拿到提示后继续调度，不要让 subagent 直接看提示。
+15. 在任务结束、明确放弃或已官方判定成功后，你可以亲自调用 `mcp__platform__stop_challenge` 做收尾。
+16. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `{result_blocker_report_path}`。
+""".strip()
+    platform_context = f"""
+比赛平台：
+{challenge["platform_server_host"]}
+
+平台认证模式：
+{challenge["platform_auth_mode"]}
+""".strip()
     return f"""
 你正在执行一个授权 CTF Web `find_flag` 任务。
 你的身份是 **main agent**，只负责：读取上下文、制定计划、调度 subagent、审核证据、做最终判定。
@@ -399,7 +485,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
 
 先执行以下硬性规则，禁止偏离：
 - 第一件事必须是读取 `~/.claude/CLAUDE.md`。
-- 你当前只应该使用 `Task`（运行日志中也可能显示为 `Agent`）、`Read`、`Grep`、`Glob`。
+- 你当前只应该使用 {main_tools_text}。
 - 你不能亲自发请求、跑命令、运行 Python、做网络探测、写结果文件。
 - 所有外部交互、命令执行、Python 执行、HTTP 请求、文件写入，都必须由 subagent 通过 `mcp__sandbox__*` 完成，以确保 `runtime_v2` 保留完整审计。
 - `Task`（运行日志中也可能显示为 `Agent`）只用于调度 subagent，不要把它当成分析结论的替代品。
@@ -413,6 +499,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - 任何位于工作区根目录或 `{ARTIFACTS_DIR_NAME}/` 下的 `*flag*.txt`、`*report*.md`、`test_*.txt`、临时脚本、样例文件，都不是规范结果文件；不要把它们当作可信输入。
 - 在最终落盘前，不要主动读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；这些路径只有在你明确派发“最终落盘”任务后才应出现有效内容。
 - 在最终落盘前，不要用 `Glob` / `Grep` 枚举 `/home/kali/workspace/{RESULTS_DIR_NAME}/`；如果当前没有最终落盘任务，就把这个目录视为不可触碰。
+{platform_rules if platform_tools_enabled else ""}
 
 角色分工必须保持清晰：
 - `observation-subagent`：唯一可以做大规模信息搜集、攻击面梳理、线索提取的执行者。
@@ -422,6 +509,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
 - `observation-subagent` 不能做漏洞测试；如果某个动作是在“通过 payload / 输入变化证明漏洞成立”，那就必须交给 `exploitation-subagent`。
 - `observation-subagent` 如果只是在允许的 observation 动作中被动直接发现了完整 flag，可以如实上报；但它不能为了拿 flag 主动升级成利用。
 - 已验证假设、已验证能力、利用结论默认保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`；是否把新的客观事实回流到 `{observation_report_path}`，只能由你决定。
+- subagent 不得调用任何比赛平台工具；平台相关的提交、提示、停题都只能由你亲自执行。
 
 强制工作流：
 1. 读取 `~/.claude/CLAUDE.md`、`{input_challenge_path}`，以及当前已经存在的规范报告文件；不要一开始就扫描整个工作区，也不要枚举 `{ARTIFACTS_DIR_NAME}` 或 `{RESULTS_DIR_NAME}`。
@@ -434,8 +522,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
 8. 如果 exploitation 缺少上下文，回到 observation 补证据，不要跳步。
 9. 如果 exploitation 带回了新的客观事实，由你决定是否重新派发 `observation-subagent` 把这些事实合并回 `{observation_report_path}`；不要把 exploitation 的“已验证成功”直接改写进 observation 结论。
 10. 只有当已有“已验证成功”的能力 / 原语时，才允许派发组合利用任务。
-11. 你审核完整证据链后，若确认 flag 真实，再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入 `{result_flag_path}` 与 `{result_final_report_path}`。
-12. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `{result_blocker_report_path}`。
+{platform_workflow_steps if platform_tools_enabled else f"11. 你审核完整证据链后，若确认 flag 真实，再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入 `{result_flag_path}` 与 `{result_final_report_path}`.\n12. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `{result_blocker_report_path}`。"}
 
 给 `observation-subagent` 派单时，必须遵守：
 - 只让它做 surface map、公开文件检查、页面和脚本读取、参数面提取、有限枚举、事实证据整理
@@ -486,7 +573,9 @@ def build_prompt(challenge: dict[str, object]) -> str:
 {hint}
 
 目标主机：
-{challenge["server_host"]}
+{challenge["target_host"]}
+
+{platform_context if platform_tools_enabled else ""}
 
 题目标识：
 {challenge["challenge_code"]}
@@ -627,10 +716,12 @@ def build_run_command(
     command.extend(["-v", f"{task_dir}:/home/kali/workspace"])
 
     challenge_env = {
-        "SERVER_HOST": str(challenge["server_host"]),
         "CHALLENGE_CODE": str(challenge["challenge_code"]),
         "CHALLENGE_ENTRYPOINT": ",".join(str(item) for item in challenge["challenge_entrypoints"]),
     }
+    server_host_value = str(challenge.get("platform_server_host") or challenge["server_host"])
+    if server_host_value:
+        challenge_env["SERVER_HOST"] = server_host_value
     if challenge["challenge_title"]:
         challenge_env["CHALLENGE_TITLE"] = str(challenge["challenge_title"])
     if challenge["challenge_description"]:
@@ -653,7 +744,21 @@ def build_run_command(
     return command
 
 
-def run_claude_task(container_name: str, prompt: str, timeout_seconds: int) -> int:
+def run_claude_task(
+    container_name: str,
+    prompt: str,
+    timeout_seconds: int,
+    *,
+    platform_tools_enabled: bool = False,
+) -> int:
+    platform_tools = (
+        " mcp__platform__submit_flag mcp__platform__view_hint mcp__platform__stop_challenge"
+        if platform_tools_enabled
+        else ""
+    )
+    tools = "Task,Read,Grep,Glob"
+    if platform_tools:
+        tools += ",mcp__platform__submit_flag,mcp__platform__view_hint,mcp__platform__stop_challenge"
     command = [
         "docker",
         "exec",
@@ -666,13 +771,13 @@ def run_claude_task(container_name: str, prompt: str, timeout_seconds: int) -> i
         'claude --verbose '
         '--mcp-config /home/kali/.claude/mcp.json '
         '--strict-mcp-config '
-        '--tools "Task,Read,Grep,Glob" '
+        f'--tools "{tools}" '
         '--allowedTools "Task Read Grep Glob '
         'mcp__sandbox__python_exec mcp__sandbox__python_get mcp__sandbox__python_output '
         'mcp__sandbox__python_interrupt mcp__sandbox__python_restart mcp__sandbox__python_session_info '
         'mcp__sandbox__terminal_open mcp__sandbox__terminal_info mcp__sandbox__terminal_read '
         'mcp__sandbox__terminal_write mcp__sandbox__terminal_interrupt mcp__sandbox__terminal_close '
-        'mcp__sandbox__list_agent_runtimes mcp__sandbox__cleanup_agent_runtime" '
+        f'mcp__sandbox__list_agent_runtimes mcp__sandbox__cleanup_agent_runtime{platform_tools}" '
         '--disallowedTools "Bash Write Edit MultiEdit WebFetch WebSearch NotebookRead NotebookEdit LS" '
         '-p "$(cat)"',
     ]
@@ -710,7 +815,7 @@ def main() -> int:
     initialize_task_dirs(task_dir)
     write_challenge_snapshot(task_dir, challenge)
     initialize_workspace_claude_config(task_dir)
-    write_claude_mcp_config(task_dir)
+    write_claude_mcp_config(task_dir, runtime_env, challenge)
 
     container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}")
     try:
@@ -726,7 +831,12 @@ def main() -> int:
         wait_for_mcp(container_name, args.ready_timeout_seconds, args.poll_interval_seconds)
         print("[+] MCP server is ready, starting Claude task...")
         prompt = build_prompt(challenge)
-        exit_code = run_claude_task(container_name, prompt, args.timeout_seconds)
+        exit_code = run_claude_task(
+            container_name,
+            prompt,
+            args.timeout_seconds,
+            platform_tools_enabled=bool(challenge.get("platform_tools_enabled")),
+        )
         if exit_code == 0:
             print("[+] Claude task completed.")
         else:

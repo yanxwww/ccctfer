@@ -4,6 +4,7 @@
 - 容器内启动 `python_terminal_mcp`（MCP 服务）
 - 使用 `run_task.py` 生成任务工作区并调用 `claude` 执行主流程
 - 通过受限工具集（`Task/Read/Grep/Glob` + `mcp__sandbox__*`）完成 observation/exploitation 流程
+- 当同时提供 `SERVER_HOST`、`AGENT_TOKEN`、`CHALLENGE_CODE` 时，为 main agent 额外接入比赛平台 MCP 的 `submit_flag` / `view_hint` / `stop_challenge`
 
 ## 项目结构
 
@@ -37,11 +38,12 @@ ccctfer/
 ### 常用可选
 
 - `SERVER_HOST`
-- `CHALLENGE_CODE`
+- `CHALLENGE_CODE`：若要启用比赛平台 `submit_flag/view_hint/stop_challenge`，则必须提供真实题目标识
 - `CHALLENGE_TITLE`
 - `CHALLENGE_DESCRIPTION`
 - `CHALLENGE_HINT`
 - `AGENT_TOKEN`：对应请求中的 `Agent-Token` 值，适合固定写入 `.env`
+- `PLATFORM_MCP_AUTH_MODE`：比赛平台 MCP 认证模式，支持 `bearer`（默认）或 `agent-token`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_AUTH_TOKEN`
 - `ANTHROPIC_MODEL`
@@ -67,8 +69,9 @@ docker build -t ccctfer-mcp:latest .
 
 ```bash
 CHALLENGE_ENTRYPOINT=http://127.0.0.1:8080
-SERVER_HOST=127.0.0.1:8080
+SERVER_HOST=platform.example.com
 AGENT_TOKEN=your-agent-token
+PLATFORM_MCP_AUTH_MODE=bearer
 CHALLENGE_CODE=demo
 CHALLENGE_TITLE=Demo CTF
 CHALLENGE_DESCRIPTION=Demo description
@@ -104,6 +107,12 @@ python3 run_task.py \
 5. 等待 `http://127.0.0.1:8000/mcp` 就绪后执行 `claude`
 6. 任务结束后归档最小产物并停止容器
 
+若本次任务同时提供了 `SERVER_HOST`、`AGENT_TOKEN`、`CHALLENGE_CODE`，则还会为 main agent 注入比赛平台 MCP。此时：
+
+- 只有 main agent 可以调用 `submit_flag`、`view_hint`、`stop_challenge`
+- observation / exploitation subagent 不会接触比赛平台工具
+- 只有 `submit_flag` 返回正确时，才算官方判题成功
+
 ## 任务产物目录
 
 每次运行会在 `workspace/` 下生成独立目录，例如：
@@ -133,6 +142,7 @@ workspace/0411-120000-demo/
 - 服务地址：`http://127.0.0.1:8000/mcp`（容器内）
 - 默认端口：`8000`
 - `run_task.py` 会生成并使用：`/home/kali/.claude/mcp.json`
+- 若比赛平台配置齐全，`/home/kali/.claude/mcp.json` 会同时包含本地 `sandbox` 与远程 `platform` 两个 MCP server
 - 启动命令来自 `Dockerfile` 的 `CMD`，实际进程为：
 	- `/home/kali/python-terminal-mcp/.venv/bin/python /home/kali/python-terminal-mcp/app/python_terminal_mcp.py ...`
 

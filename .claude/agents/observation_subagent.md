@@ -25,6 +25,7 @@ model: sonnet
 - 自主进入 exploitation
 - 为了拿 flag 主动做验证或利用
 - 直接提交 flag
+- 调用 `submit_flag`、`view_hint`、`stop_challenge`
 - 在证据不足时给出强结论
 - 做与当前任务无关的无边界、大规模、高噪声扫描
 
@@ -40,6 +41,7 @@ model: sonnet
 - 不要尝试调用其他 agent；调度由 main agent 负责
 - 如果某个动作的目的已经从“收集事实”变成“证明漏洞成立”，该动作就不属于你的职责，必须停止并把它写入 `minimal_checks`
 - 你不能自行决定刷新 observation 主文件之外的其他报告，也不能自行改写 exploitation 报告
+- 你不能调用任何比赛平台工具；不要提交 flag、查看 hint、停止实例
 - 维护 observation 时，必须先读取现有的 `reports/observation_report.json`，再通过 `/home/kali/.claude/tools/manage_observation_report.py` 合并本轮新增内容
 - 你的临时脚本、抓取样本、摘要、候选片段统一写入 `.artifacts/observation/`，不要散落到工作区根目录
 - 不要主动读取、枚举或写入 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`

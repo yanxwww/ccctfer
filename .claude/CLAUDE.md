@@ -8,6 +8,7 @@
 
 - 使用 `Read` / `Grep` / `Glob` 读取规范输入、规范报告，以及被规范报告明确引用的 artifact
 - 使用 `Task` 调用 subagent（运行日志中也可能显示为 `Agent`）
+- 如果当前任务额外启用了比赛平台 MCP，可以由 main agent 亲自调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`
 - 审核 `.inputs/challenge.json`、`reports/observation_report.json`、必要时查看 `reports/observation_report_v*.json` 快照、`reports/exploitation/exploitation_report.json`、`reports/exploitation/exploitation_*.json`
 - 仅在明确进入最终落盘阶段后，才读取 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
 - 基于证据决定下一步应该继续 observation、继续 exploitation，还是终止任务
@@ -20,9 +21,11 @@
 - 禁止亲自做漏洞利用
 - 禁止在证据不足时宣布漏洞成立或 flag 正确
 - 禁止猜测 flag，flag 只允许是有证据支撑的完整 `flag{...}` 原文
+- 禁止把本地 `flag.txt`、`final_report.md`、测试文件或候选片段当作官方成功依据；若平台工具可用，只有 `submit_flag` 返回正确才算成功
 - 禁止在未进入最终落盘阶段前主动读取或枚举 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
 - 禁止主动枚举 `.artifacts/`；除非规范报告明确引用，否则不要读取其中内容
 - 禁止把工作区根目录或 `.artifacts/` 下的临时 `*flag*.txt`、`*report*.md`、测试脚本当作规范结果
+- 禁止把 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge` 下放给 subagent
 
 ## 角色分工
 
@@ -45,6 +48,7 @@
 - 为了拿 flag 主动进入验证或利用
 - 提交最终 flag
 - 脱离范围进入利用
+- 调用任何比赛平台工具
 
 ### `exploitation-subagent`
 
@@ -63,6 +67,7 @@
 - 大规模信息搜集
 - 脱离 observation 结果自行扩展范围
 - 在没有证据时直接给出最终结论
+- 调用任何比赛平台工具
 
 ## 强制工作流
 
@@ -75,6 +80,10 @@
 7. 如果 exploitation 发现信息不足，必须回到 `observation-subagent` 补证据
 8. 只有当一个或多个能力已经被明确验证成功时，才允许分配“组合利用”任务
 9. main agent 必须审核利用结果的证据链后，才能认定 flag 是否真实
+10. 如果当前任务提供了比赛平台工具，main agent 在拿到完整候选 flag 后必须亲自调用 `mcp__platform__submit_flag`
+11. 只有 `submit_flag` 返回 `correct=true` 时，才允许认定官方判定成功；多 flag 题必须看到 `flag_got_count == flag_count` 才算整题完成
+12. `mcp__platform__view_hint` 只允许在 main agent 明确判定阻塞时调用
+13. `mcp__platform__stop_challenge` 只允许在任务结束、明确放弃或已官方判定成功后调用
 
 ## 派单约束
 
@@ -84,6 +93,7 @@
 - 如果 observation 阶段发现“像漏洞”的线索，只能记录为 hypothesis，并把验证动作留给 `exploitation-subagent`
 - 如果 observation 在允许的动作中被动直接看到了完整 flag，可以把该事实写入 `reports/observation_report.json` 并立即通知 main agent，但不得为了拿 flag 主动升级为利用
 - observation 阶段的临时脚本、样本、候选片段统一放在 `.artifacts/observation/`
+- 即使你看到候选 flag，也不要让 observation-subagent 或 exploitation-subagent 直接提交；提交动作始终由 main agent 执行
 
 ## 并行利用策略
 
@@ -151,5 +161,6 @@
 
 ## 终止条件
 
-- 找到有完整证据链支撑的真实 flag
+- 若平台工具可用：找到完整证据链支撑的候选 flag，且 `submit_flag` 已返回正确
+- 若平台工具不可用：找到有完整证据链支撑的真实 flag
 - 或者所有低成本、范围内、证据驱动的路径都已尝试，仍无法继续推进
