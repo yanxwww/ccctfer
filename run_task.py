@@ -44,6 +44,13 @@ RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
 RESULT_CLAUDE_OUTPUT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/claude_output.txt"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
+MAX_PARALLEL_EXPLOITATION = 2
+MAX_TOTAL_EXPLOITATION_SUBAGENTS = 4
+MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
+MAX_TERMINAL_READ_CALLS = 40
+MAX_INLINE_TOOL_OUTPUT_BYTES = 4096
+MAX_INLINE_TOOL_OUTPUT_LINES = 20
+GRACEFUL_CLAUDE_INTERRUPT_SECONDS = 10
 
 REQUIRED_CHALLENGE_ENV_KEYS = ["CHALLENGE_ENTRYPOINT"]
 OPTIONAL_CHALLENGE_ENV_KEYS = [
@@ -429,139 +436,62 @@ def build_prompt(challenge: dict[str, object]) -> str:
     result_flag_path = f"/home/kali/workspace/{RESULT_FLAG_RELATIVE_PATH}"
     result_final_report_path = f"/home/kali/workspace/{RESULT_FINAL_REPORT_RELATIVE_PATH}"
     result_blocker_report_path = f"/home/kali/workspace/{RESULT_BLOCKER_REPORT_RELATIVE_PATH}"
-    result_claude_output_path = f"/home/kali/workspace/{RESULT_CLAUDE_OUTPUT_RELATIVE_PATH}"
-    observation_merger_path = f"/home/kali/workspace/{OBSERVATION_MERGER_RELATIVE_PATH}"
-    main_tools_text = "`Task`（运行日志中也可能显示为 `Agent`）、`Read`、`Grep`、`Glob`"
     challenge_mcp_enabled = bool(challenge.get("challenge_mcp_enabled"))
+    challenge_mcp_lines = []
     if challenge_mcp_enabled:
-        main_tools_text += "，以及 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`"
-    challenge_mcp_rules = """
-- 只有当本次任务提示词明确声明 challenge MCP 可用时，你才可以亲自调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`。
-- challenge MCP 工具只对你这个 main agent 开放；禁止把它们下放给任何 subagent。
-- 只有当 exploitation 带回了完整、可复核、来源明确的候选 `flag{...}` 后，你才可以亲自调用 `mcp__platform__submit_flag`。
-- 只有 `mcp__platform__submit_flag` 返回 `correct=true`，才允许认定“官方判定成功”；本地 `flag.txt`、`final_report.md`、候选片段、测试文件都不是官方成功信号。
-- 如果题目存在多个 flag，只有当平台返回的 `flag_got_count == flag_count` 时，才允许把整道题判定为完成；否则继续当前题目，不要提前收工。
-- `mcp__platform__view_hint` 只允许在你明确判定“当前题目已阻塞”后调用。
-- `mcp__platform__stop_challenge` 只允许在任务结束、明确放弃或已经官方判定成功后调用。
-""".strip()
-    challenge_mcp_workflow_steps = """
-11. 如果 exploitation 带回了候选完整 flag，你必须亲自调用 `mcp__platform__submit_flag` 做官方判定。
-12. 只有平台确认正确后，你才可以认定成功，并再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入结果目录。
-13. 如果平台返回不正确，必须继续当前题目的证据驱动分析，不能把候选 flag 当作成功。
-14. 如果你明确判定当前题目已阻塞，才可以亲自调用 `mcp__platform__view_hint`；拿到提示后继续调度。
-15. 在任务结束、明确放弃或已官方判定成功后，你可以亲自调用 `mcp__platform__stop_challenge` 做收尾。
-16. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入结果阻塞报告。
-""".strip()
-    challenge_mcp_context = f"""
-比赛平台：
-{challenge["challenge_mcp_server"]}
-""".strip()
-    return f"""
-你正在执行一个授权 CTF Web `find_flag` 任务。
-你的身份是 **main agent**，只负责：读取上下文、制定计划、调度 subagent、审核证据、做最终判定。
-你不是执行者，禁止亲自做信息搜集、漏洞验证或漏洞利用。
+        challenge_mcp_lines.extend(
+            [
+                "- challenge MCP 已启用；当前只开放 `submit_flag` 与 `view_hint`，并且只允许你这个 main agent 调用，禁止下放给 subagent。",
+                "- 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`，也不要把思路转向“先起题再拿入口”。",
+                "- 只有 exploitation 带回完整、可复核、来源明确的候选 `flag{...}` 后，你才可以调用 `mcp__platform__submit_flag`。",
+                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；如果平台还有剩余 flag，继续当前题目，不要提前收工。",
+                "- `view_hint` 只允许在你明确判定当前题目已经阻塞时调用。",
+            ]
+        )
 
-先执行以下硬性规则，禁止偏离：
-- 第一件事必须是读取 `~/.claude/CLAUDE.md`。
-- 你当前只应该使用 {main_tools_text}。
-- 你不能亲自发请求、跑命令、运行 Python、做网络探测、写结果文件。
-- 所有外部交互、命令执行、Python 执行、HTTP 请求、文件写入，都必须由 subagent 通过 `mcp__sandbox__*` 完成，以确保 `runtime_v2` 保留完整审计。
-- `Task`（运行日志中也可能显示为 `Agent`）只用于调度 subagent，不要把它当成分析结论的替代品。
-- 禁止猜测 flag、补全 flag、脑补漏洞、脑补隐藏接口、脑补返回内容。
-- 只有拿到完整、可复核、来源明确的 `flag{{...}}` 原文，才可以认定“找到 flag”。
-- 如果只是拿到疑似片段、页面提示、推测结果、历史缓存、他人结论，都不能当作最终 flag。
-- 如果证据不足，请明确说明“未找到 flag / 当前阻塞原因”，不要编造结论。
-- 不要扫描无关 IP、无关端口、无关域名；仅允许围绕题目提供的 entrypoint、同源重定向和解题必需的直接关联资源行动。
-- 固定只使用这些规范路径：题目信息在 `{input_challenge_path}`，observation 主文件在 `{observation_report_path}`，exploitation 结果默认在 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/`，最终结果只能写入 `/home/kali/workspace/{RESULTS_DIR_NAME}/`。
-- 除非某份规范报告明确引用某个 artifact 路径，否则不要主动扫描 `/home/kali/workspace/{ARTIFACTS_DIR_NAME}/` 下的临时文件，也不要用 `Glob` / `Grep` 枚举它。
-- 任何位于工作区根目录或 `{ARTIFACTS_DIR_NAME}/` 下的 `*flag*.txt`、`*report*.md`、`test_*.txt`、临时脚本、样例文件，都不是规范结果文件；不要把它们当作可信输入。
-    - 在任务执行期间，不要主动读取 `{result_claude_output_path}`；这是 launcher 在 Claude 运行时自动归档的输出文件，不是你的工作输入。
-    - 在最终落盘前，不要主动读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；这些路径只有在你明确派发“最终落盘”任务后才应出现有效内容。
-- 在最终落盘前，不要用 `Glob` / `Grep` 枚举 `/home/kali/workspace/{RESULTS_DIR_NAME}/`；如果当前没有最终落盘任务，就把这个目录视为不可触碰。
-{challenge_mcp_rules if challenge_mcp_enabled else ""}
+    prompt_lines = [
+        "你正在执行一个授权 Web CTF `find_flag` 任务。",
+        "先读取 `~/.claude/CLAUDE.md`，并严格按其中规则工作；不要在这里重复整份模板。",
+        "",
+        "本次额外预算与调度约束：",
+        "- 固定状态机：`initial_observation -> targeted_exploitation -> optional_finalization`；只有 exploitation 明确指出缺少某个具体事实时，才允许一次 `supplemental_observation`。",
+        "- 起步只允许 1 个 `observation-subagent`。",
+        f"- `exploitation-subagent` 默认单线程；只有 `reports/observation_report.json` 明确给出 2 个彼此独立且高价值的向量时，才允许并行到 {MAX_PARALLEL_EXPLOITATION} 个；全程 exploitation 子代理总数不得超过 {MAX_TOTAL_EXPLOITATION_SUBAGENTS} 个。",
+        "- 只允许调度 `observation-subagent` 与 `exploitation-subagent`；不要使用 `general-purpose` 或其它未约束角色。",
+        "- `深度信息搜集` 不是自由扩张阶段；它只能作为一次有明确目标的 supplemental observation。",
+        "- 派单文字必须短，只给：目标、允许输入、禁止事项、输出路径、预算；不要复制整份规则给 subagent。",
+        f"- subagent 优先使用 `mcp__sandbox__python_exec` 做 HTTP 抓取、解析和结构化输出；`terminal_*` 只用于确实需要 TTY 或交互式命令的场景。",
+        f"- 如果 `terminal_read` 返回 `should_stop_polling=true`、`read_budget_exhausted=true`，或同一 cursor 连续空读达到 {MAX_CONSECUTIVE_EMPTY_TERMINAL_READS} 次，就立刻停止该 polling 分支，把控制权交回 main agent。",
+        f"- 单个 terminal 会话的 `terminal_read` 总次数预算是 {MAX_TERMINAL_READ_CALLS}；不要为等待长任务而高频空轮询。",
+        f"- 任何原始响应、源码、HTML、JS、CSS、命令输出超过 {MAX_INLINE_TOOL_OUTPUT_BYTES} bytes，都只允许落盘到 `.artifacts/` 或 runtime log；回报时只给 `path/status/content-type/bytes/sha256/≤{MAX_INLINE_TOOL_OUTPUT_LINES}行摘要`。",
+        "- `bootstrap`、`jquery`、minified JS/CSS 等 vendor 文件，默认禁止全文回灌上下文；只有命中目标关键词时才提取局部片段。",
+        "- `status>=400` 或标准 HTML 404 页面只能记入 `negative_findings`，不得写成 `Found`，也不得直接升级为 exploitation。",
+        f"- main agent 只允许在阶段切换或 `reports/observation_report.json` 完成 merge 后重新读取它；不要每轮都全文重读。",
+        f"- 非 finalization 阶段不得读取 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`；finalization 最多只允许发生一次。",
+        "- 如果 observation 被动直接发现了完整 flag，可以跳过额外验证；但最终写 `.results/flag.txt` 与 `.results/final_report.md` 的任务仍必须交给 `exploitation-subagent`。",
+        *challenge_mcp_lines,
+        "",
+        "规范路径：",
+        f"- challenge: `{input_challenge_path}`",
+        f"- observation: `{observation_report_path}`",
+        f"- default exploitation: `{default_exploitation_report_path}`",
+        f"- observation artifacts: `{observation_artifacts_dir}`",
+        f"- exploitation artifacts: `{exploitation_artifacts_dir}`",
+        f"- final results: `/home/kali/workspace/{RESULTS_DIR_NAME}/`",
+        "",
+        f"题目标题：{challenge['challenge_title']}",
+        f"题目描述：{description}",
+        f"题目提示：{hint}",
+        f"目标主机：{challenge['target_host']}",
+        f"题目标识：{challenge['challenge_code']}",
+        "入口点：",
+        entrypoint_lines,
+    ]
 
-角色分工必须保持清晰：
-- `observation-subagent`：唯一可以做大规模信息搜集、攻击面梳理、线索提取的执行者。
-- `exploitation-subagent`：只负责单个漏洞假设 / 单个能力目标的最小验证与受控利用。
-- 只有在已有一个或多个“已验证成功”的能力 / 原语时，你才可以指派 `exploitation-subagent` 做组合利用。
-- 你自己永远不允许做 observation、验证或利用。
-- `observation-subagent` 不能做漏洞测试；如果某个动作是在“通过 payload / 输入变化证明漏洞成立”，那就必须交给 `exploitation-subagent`。
-- `observation-subagent` 如果只是在允许的 observation 动作中被动直接发现了完整 flag，可以如实上报；但它不能为了拿 flag 主动升级成利用。
-- 已验证假设、已验证能力、利用结论默认保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`；是否把新的客观事实回流到 `{observation_report_path}`，只能由你决定。
-{"- subagent 不得调用任何 challenge MCP 工具；提交、提示、停题都只能由你亲自执行。" if challenge_mcp_enabled else ""}
+    if challenge_mcp_enabled:
+        prompt_lines.extend(["", f"比赛平台：{challenge['challenge_mcp_server']}"])
 
-强制工作流：
-1. 读取 `~/.claude/CLAUDE.md`、`{input_challenge_path}`，以及当前已经存在的规范报告文件；不要一开始就扫描整个工作区，也不要枚举 `{ARTIFACTS_DIR_NAME}` 或 `{RESULTS_DIR_NAME}`。
-2. 必须先调用 `observation-subagent` 生成并维护 `{observation_report_path}`。
-3. `{observation_report_path}` 是默认且唯一的 observation 主文件；不要为了常规补充 observation 而制造多个工作文件。
-4. 只有在你明确需要保留审计快照时，才额外要求生成 `/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v2.json`、`/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v3.json` 等快照；工作集仍以 `{observation_report_path}` 为准。
-5. 把 `{observation_report_path}` 视为持续维护的数据集：补充 observation 时要求 subagent 先读取当前文件，再通过 `{observation_merger_path}` 对其做 merge-update，而不是整份覆盖重写。
-6. 审核 `{observation_report_path}` 中的事实、evidence、hypotheses，只从证据出发，不从经验套路出发。
-7. 若只有一个攻击向量，就派发一个 `exploitation-subagent`；若存在多个彼此独立的攻击向量，可以并行派发 2-3 个 `exploitation-subagent`。
-8. 如果 exploitation 缺少上下文，回到 observation 补证据，不要跳步。
-9. 如果 exploitation 带回了新的客观事实，由你决定是否重新派发 `observation-subagent` 把这些事实合并回 `{observation_report_path}`；不要把 exploitation 的“已验证成功”直接改写进 observation 结论。
-10. 只有当已有“已验证成功”的能力 / 原语时，才允许派发组合利用任务。
-{challenge_mcp_workflow_steps if challenge_mcp_enabled else f"11. 你审核完整证据链后，若确认 flag 真实，再指派合适的 `exploitation-subagent` 将 `flag.txt` 和 `final_report.md` 写入 `{result_flag_path}` 与 `{result_final_report_path}`.\n12. 如果最终未找到 flag，则指派合适的 `exploitation-subagent` 写入 `{result_blocker_report_path}`。"}
-
-给 `observation-subagent` 派单时，必须遵守：
-- 只让它做 surface map、公开文件检查、页面和脚本读取、参数面提取、有限枚举、事实证据整理
-- 不要让它做 SSRF / SQLi / SSTI / XSS / RCE / 路径穿越 / 越权 等漏洞验证
-- 不要让它做参数篡改、对象 ID 切换、恶意 payload 注入、内网目标替换
-- 如果 observation 阶段发现疑似漏洞点，只能记录为 hypothesis，并把验证动作留给 `exploitation-subagent`
-- 如果 observation 在允许动作中被动直接看到了完整 flag，可以把它当作事实证据上报；但不要命令它为了拿 flag 主动做验证或利用
-- 要求它维护 `{observation_report_path}` 时，强调“先读现有文件，再通过 `{observation_merger_path}` 合并新增内容、更新状态”，不要整份覆盖抹掉旧 evidence / hypotheses / surface_map
-- observation 阶段产生的临时脚本、抓取样本、摘要、候选片段，应写入 `{observation_artifacts_dir}`，不要散落到工作区根目录
-
-并行 exploitation 时，必须遵守：
-- 只有当多个攻击向量彼此独立时，才并行
-- 每个 `exploitation-subagent` 只负责一个向量，不能混做多个方向
-- 并行数量默认控制在 2-3 个
-- 每个 subagent 都要分配唯一输出文件，例如 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web.json`、`/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_smb.json`、`/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_ssh.json`
-- 禁止多个 subagent 同时写同一个报告文件
-- 并行阶段默认不要让多个 subagent 同时写 `{result_flag_path}`、`{result_final_report_path}`、`{result_blocker_report_path}`
-- 等并行结果都返回后，再审核并决定是否派发一个最终落盘任务
-- exploitation 阶段产生的脚本、请求样本、下载文件、候选 flag、PoC 产物都应写入 `{exploitation_artifacts_dir}/<vector>/` 之类的专属子目录，不要直接丢在工作区根目录
-
-报告文件必须防止覆盖：
-- `{observation_report_path}` 是默认的唯一 observation 主文件
-- 常规 observation 刷新时，直接维护 `{observation_report_path}`
-- 对它的更新必须是 merge-update：追加新项、合并已有项、按状态淘汰旧项，而不是整份重写覆盖
-- 旧 evidence、旧 hypotheses、旧 surface_map 项目，除非被明确判错或转入 `negative_findings`，否则不要无痕删除
-- 只有在你明确要求保留历史快照时，才额外生成 `/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v2.json`、`/home/kali/workspace/{REPORTS_DIR_NAME}/observation_report_v3.json`
-- exploitation 的验证状态、能力确认、利用结果保留在 `{default_exploitation_report_path}` 或 `/home/kali/workspace/{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_*.json`，不要把它们直接写成 observation 主文件里的“已确认漏洞”
-- 在派发 exploitation 任务前，先检查目标报告文件是否已经存在
-- 如果已存在，分配新的版本号文件名，而不是覆盖旧文件
-- 命名示例：`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web.json`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web_v2.json`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_web_v3.json`
-- 默认共享文件也一样：`{DEFAULT_EXPLOITATION_REPORT_RELATIVE_PATH}`、`{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_report_v2.json`
-- `status` 写进 JSON 内容，不要放进主文件名
-- 规范输入、规范报告、规范结果之外的临时文件一律视为 artifact；除非被规范报告引用，否则不得把它们当作结论依据
-
-反幻觉要求：
-- 不要把“看起来像 flag”写成 flag。
-- 不要把“可能存在 SSRF / SQLi / RCE”写成“已确认存在”。
-- 不要引用未实际执行过的命令、未实际访问过的 URL、未实际读取过的文件。
-- 如果你引用某条证据，必须能指出它来自哪个命令、哪个文件或哪个响应。
-
-题目标题：
-{challenge["challenge_title"]}
-
-题目描述：
-{description}
-
-题目提示：
-{hint}
-
-目标主机：
-{challenge["target_host"]}
-
-{challenge_mcp_context if challenge_mcp_enabled else ""}
-
-题目标识：
-{challenge["challenge_code"]}
-
-入口点：
-{entrypoint_lines}
-""".strip()
+    return "\n".join(prompt_lines).strip()
 
 
 def container_is_running(container_name: str) -> bool:
@@ -724,8 +654,8 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False) -> str:
     tools = "Task,Read,Grep,Glob"
     platform_tools = ""
     if challenge_mcp_enabled:
-        tools += ",mcp__platform__submit_flag,mcp__platform__view_hint,mcp__platform__stop_challenge"
-        platform_tools = " mcp__platform__submit_flag mcp__platform__view_hint mcp__platform__stop_challenge"
+        tools += ",mcp__platform__submit_flag,mcp__platform__view_hint"
+        platform_tools = " mcp__platform__submit_flag mcp__platform__view_hint"
 
     output_path = shlex.quote(f"/home/kali/workspace/{RESULT_CLAUDE_OUTPUT_RELATIVE_PATH}")
     return (
@@ -751,7 +681,7 @@ def run_claude_task(
     timeout_seconds: int,
     *,
     challenge_mcp_enabled: bool = False,
-) -> int:
+) -> tuple[int, bool]:
     command = [
         "docker",
         "exec",
@@ -769,16 +699,51 @@ def run_claude_task(
     except subprocess.TimeoutExpired:
         print(f"[!] Claude task timed out after {timeout_seconds} seconds.", file=sys.stderr)
         interrupt_claude(container_name)
-        process.kill()
-        process.communicate()
-        return 124
+        try:
+            process.communicate(timeout=GRACEFUL_CLAUDE_INTERRUPT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return 124, True
+        return process.returncode or 124, True
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user, stopping Claude...", file=sys.stderr)
         interrupt_claude(container_name)
         process.kill()
         process.communicate()
-        return 130
-    return process.returncode or 0
+        return 130, False
+    return process.returncode or 0, False
+
+
+def read_flag_result(task_dir: Path) -> str | None:
+    flag_path = task_dir / RESULT_FLAG_RELATIVE_PATH
+    if not flag_path.is_file():
+        return None
+    try:
+        content = flag_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if re.fullmatch(r"flag\{[^\r\n]+\}", content):
+        return content
+    return None
+
+
+def has_complete_final_results(task_dir: Path) -> tuple[bool, str | None]:
+    flag_value = read_flag_result(task_dir)
+    report_path = task_dir / RESULT_FINAL_REPORT_RELATIVE_PATH
+    if not flag_value:
+        return False, None
+    if not report_path.is_file():
+        return False, None
+    try:
+        report_text = report_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, None
+    if not report_text.strip():
+        return False, None
+    if flag_value not in report_text:
+        return False, None
+    return True, flag_value
 
 
 def main() -> int:
@@ -813,12 +778,21 @@ def main() -> int:
         wait_for_mcp(container_name, args.ready_timeout_seconds, args.poll_interval_seconds)
         print("[+] MCP server is ready, starting Claude task...")
         prompt = build_prompt(challenge)
-        exit_code = run_claude_task(
+        exit_code, timed_out = run_claude_task(
             container_name,
             prompt,
             args.timeout_seconds,
             challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
         )
+        completed_with_results, final_flag = has_complete_final_results(task_dir)
+        if exit_code != 0 and completed_with_results:
+            if timed_out:
+                print(
+                    f"[+] Claude task timed out after finalization, but result files are complete; treating run as success ({final_flag})."
+                )
+            else:
+                print(f"[+] Claude task exited with code {exit_code}, but complete result files were found; treating run as success ({final_flag}).")
+            exit_code = 0
         if exit_code == 0:
             print("[+] Claude task completed.")
         else:

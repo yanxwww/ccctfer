@@ -33,9 +33,16 @@ DEFAULT_IDLE_OUTPUT_TIMEOUT_SECONDS = 60
 DEFAULT_HARD_TIMEOUT_SECONDS = 1800
 
 DEFAULT_MAX_OUTPUT_MESSAGES = 200
-DEFAULT_MAX_TOTAL_OUTPUT_BYTES = 256 * 1024
-DEFAULT_MAX_SINGLE_OUTPUT_BYTES = 16 * 1024
-DEFAULT_OUTPUT_PAGE_SIZE = 100
+DEFAULT_MAX_TOTAL_OUTPUT_BYTES = 8 * 1024
+DEFAULT_MAX_SINGLE_OUTPUT_BYTES = 4 * 1024
+DEFAULT_OUTPUT_PAGE_SIZE = 20
+DEFAULT_TOOL_OUTPUT_PAGE_BYTES = 8 * 1024
+DEFAULT_TOOL_OUTPUT_PREVIEW_LINES = 20
+DEFAULT_TOOL_OUTPUT_PREVIEW_BYTES = 4 * 1024
+DEFAULT_TERMINAL_READ_WAIT_SECONDS = 1.0
+DEFAULT_MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
+DEFAULT_MAX_TERMINAL_READ_CALLS = 40
+TERMINAL_READ_BACKOFF_SECONDS = (1, 2, 4, 8)
 
 
 def utcnow_iso() -> str:
@@ -223,10 +230,17 @@ class TerminalRecord:
     last_output_monotonic: float = field(default_factory=monotonic_now)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    output_condition: threading.Condition = field(init=False, repr=False)
     terminate_requested: bool = False
+    read_call_count: int = 0
+    consecutive_empty_reads: int = 0
+    last_read_cursor: Optional[int] = None
     pty_master_fd: Optional[int] = field(default=None, repr=False)
     pty_slave_name: Optional[str] = None
     process: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.output_condition = threading.Condition(self.lock)
 
     def to_public_dict(self) -> dict[str, Any]:
         with self.lock:
@@ -261,6 +275,9 @@ class TerminalRecord:
                 "wait_timeout_seconds": self.wait_timeout_seconds,
                 "hard_timeout_seconds": self.hard_timeout_seconds,
                 "env_overrides": dict(self.env_overrides),
+                "read_call_count": self.read_call_count,
+                "consecutive_empty_reads": self.consecutive_empty_reads,
+                "last_read_cursor": self.last_read_cursor,
             }
 
 
@@ -531,12 +548,65 @@ class PythonTerminalExecutorV2:
                     }
                 )
             self._write_terminal_metadata(record)
+            record.output_condition.notify_all()
+
+    def _summarize_tool_output_string(self, value: str) -> tuple[str, bool]:
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) <= DEFAULT_TOOL_OUTPUT_PREVIEW_BYTES and value.count("\n") < DEFAULT_TOOL_OUTPUT_PREVIEW_LINES:
+            return value, False
+
+        lines = value.splitlines()
+        if lines:
+            preview = "\n".join(lines[:DEFAULT_TOOL_OUTPUT_PREVIEW_LINES])
+        else:
+            preview = value
+
+        preview_bytes = preview.encode("utf-8", errors="replace")
+        if len(preview_bytes) > DEFAULT_TOOL_OUTPUT_PREVIEW_BYTES:
+            preview = preview_bytes[:DEFAULT_TOOL_OUTPUT_PREVIEW_BYTES].decode("utf-8", errors="ignore")
+
+        digest = hashlib.sha256(encoded).hexdigest()[:16]
+        summary = (
+            f"{preview}\n...[truncated; bytes={len(encoded)}; sha256={digest}; "
+            "see output_log_path for full content]"
+        )
+        return summary, True
+
+    def _sanitize_tool_output_value(self, value: Any) -> tuple[Any, bool]:
+        if isinstance(value, str):
+            return self._summarize_tool_output_string(value)
+        if isinstance(value, list):
+            items: list[Any] = []
+            truncated = False
+            for item in value:
+                sanitized_item, item_truncated = self._sanitize_tool_output_value(item)
+                items.append(sanitized_item)
+                truncated = truncated or item_truncated
+            return items, truncated
+        if isinstance(value, dict):
+            payload: dict[str, Any] = {}
+            truncated = False
+            for key, item in value.items():
+                sanitized_item, item_truncated = self._sanitize_tool_output_value(item)
+                payload[key] = sanitized_item
+                truncated = truncated or item_truncated
+            return payload, truncated
+        return value, False
 
     def _load_output_page(self, path: Path, cursor: int = 0, limit: int = DEFAULT_OUTPUT_PAGE_SIZE) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         next_cursor = cursor
+        total_bytes = 0
+        truncated_items_count = 0
         if not path.exists():
-            return {"items": items, "cursor": cursor, "next_cursor": cursor, "has_more": False}
+            return {
+                "items": items,
+                "cursor": cursor,
+                "next_cursor": cursor,
+                "has_more": False,
+                "truncated_items_count": 0,
+                "page_bytes": 0,
+            }
 
         with path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle):
@@ -544,8 +614,16 @@ class PythonTerminalExecutorV2:
                     continue
                 if len(items) >= limit:
                     break
+                raw_item = json.loads(line)
+                sanitized_item, item_truncated = self._sanitize_tool_output_value(raw_item)
+                item_bytes = len(json.dumps(sanitized_item, ensure_ascii=False, default=json_default).encode("utf-8"))
+                if items and total_bytes + item_bytes > DEFAULT_TOOL_OUTPUT_PAGE_BYTES:
+                    break
                 next_cursor = line_number + 1
-                items.append(json.loads(line))
+                items.append(sanitized_item)
+                total_bytes += item_bytes
+                if item_truncated:
+                    truncated_items_count += 1
 
         has_more = False
         with path.open("r", encoding="utf-8") as handle:
@@ -554,7 +632,14 @@ class PythonTerminalExecutorV2:
                     has_more = True
                     break
 
-        return {"items": items, "cursor": cursor, "next_cursor": next_cursor, "has_more": has_more}
+        return {
+            "items": items,
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "truncated_items_count": truncated_items_count,
+            "page_bytes": total_bytes,
+        }
 
     def _session_key(self, runtime_key: str, session_name: str) -> tuple[str, str]:
         return runtime_key, self._sanitize_name(session_name)
@@ -1086,6 +1171,7 @@ class PythonTerminalExecutorV2:
         page = self._load_output_page(Path(record.output_log_path), cursor=cursor, limit=limit)
         page["execution_id"] = execution_id
         page["status"] = record.status
+        page["output_log_path"] = record.output_log_path
         return page
 
     def python_interrupt(self, execution_id: str) -> bool:
@@ -1265,6 +1351,7 @@ class PythonTerminalExecutorV2:
                         record.error_summary = record.error_summary or f"Terminal exited with code {return_code}."
                     self._write_terminal_metadata(record)
                     record.done_event.set()
+                    record.output_condition.notify_all()
                 self._close_pty_master(record)
                 self._audit(
                     "terminal_finished",
@@ -1432,7 +1519,13 @@ class PythonTerminalExecutorV2:
             }
         return record.to_public_dict()
 
-    def terminal_read(self, terminal_id: str, cursor: int = 0, limit: int = DEFAULT_OUTPUT_PAGE_SIZE) -> dict[str, Any]:
+    def terminal_read(
+        self,
+        terminal_id: str,
+        cursor: int = 0,
+        limit: int = DEFAULT_OUTPUT_PAGE_SIZE,
+        wait_for_output_seconds: float = DEFAULT_TERMINAL_READ_WAIT_SECONDS,
+    ) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
         if record is None:
             return {
@@ -1443,17 +1536,126 @@ class PythonTerminalExecutorV2:
                 "items": [],
                 "error_summary": "Terminal not found.",
             }
+        with record.lock:
+            record.read_call_count += 1
+            read_call_count = record.read_call_count
+            if read_call_count > DEFAULT_MAX_TERMINAL_READ_CALLS:
+                record.error_summary = (
+                    f"Terminal read budget exceeded ({DEFAULT_MAX_TERMINAL_READ_CALLS} calls). "
+                    "Stop polling and return control to the main agent."
+                )
+                self._write_terminal_metadata(record)
+                self._audit(
+                    "terminal_read",
+                    terminal_id=terminal_id,
+                    runtime_key=record.runtime_key,
+                    agent_id=record.agent_id,
+                    group_id=record.group_id,
+                    cursor=cursor,
+                    next_cursor=cursor,
+                    item_count=0,
+                    read_call_count=read_call_count,
+                    consecutive_empty_reads=record.consecutive_empty_reads,
+                    should_stop_polling=True,
+                    read_budget_exhausted=True,
+                )
+                return {
+                    "terminal_id": terminal_id,
+                    "cursor": cursor,
+                    "next_cursor": cursor,
+                    "has_more": False,
+                    "items": [],
+                    "status": record.status,
+                    "output_log_path": record.output_log_path,
+                    "read_call_count": read_call_count,
+                    "consecutive_empty_reads": record.consecutive_empty_reads,
+                    "recommended_wait_seconds": None,
+                    "should_stop_polling": True,
+                    "read_budget_exhausted": True,
+                    "error_summary": record.error_summary,
+                }
+        self._wait_for_terminal_output(record, cursor=cursor, wait_timeout_seconds=wait_for_output_seconds)
         page = self._load_output_page(Path(record.output_log_path), cursor=cursor, limit=limit)
+        with record.lock:
+            empty_same_cursor = not page["items"] and page["next_cursor"] == cursor
+            if empty_same_cursor:
+                if record.last_read_cursor == cursor:
+                    record.consecutive_empty_reads += 1
+                else:
+                    record.consecutive_empty_reads = 1
+                record.last_read_cursor = cursor
+            else:
+                record.consecutive_empty_reads = 0
+                record.last_read_cursor = page["next_cursor"]
+
+            consecutive_empty_reads = record.consecutive_empty_reads
+            should_stop_polling = consecutive_empty_reads >= DEFAULT_MAX_CONSECUTIVE_EMPTY_TERMINAL_READS
+            backoff_index = min(max(consecutive_empty_reads - 1, 0), len(TERMINAL_READ_BACKOFF_SECONDS) - 1)
+            recommended_wait_seconds = (
+                TERMINAL_READ_BACKOFF_SECONDS[backoff_index] if empty_same_cursor else 0
+            )
+            if should_stop_polling:
+                record.error_summary = (
+                    "No new terminal output after 3 consecutive reads at the same cursor. "
+                    "Stop polling and return control to the main agent."
+                )
+            elif not empty_same_cursor:
+                record.error_summary = None
+            self._write_terminal_metadata(record)
+
         page["terminal_id"] = terminal_id
         page["status"] = record.status
+        page["output_log_path"] = record.output_log_path
+        page["read_call_count"] = read_call_count
+        page["consecutive_empty_reads"] = consecutive_empty_reads
+        page["recommended_wait_seconds"] = recommended_wait_seconds
+        page["should_stop_polling"] = should_stop_polling
+        page["read_budget_exhausted"] = False
+        if should_stop_polling:
+            page["error_summary"] = record.error_summary
+        self._audit(
+            "terminal_read",
+            terminal_id=terminal_id,
+            runtime_key=record.runtime_key,
+            agent_id=record.agent_id,
+            group_id=record.group_id,
+            cursor=cursor,
+            next_cursor=page["next_cursor"],
+            item_count=len(page["items"]),
+            read_call_count=read_call_count,
+            consecutive_empty_reads=consecutive_empty_reads,
+            should_stop_polling=should_stop_polling,
+            read_budget_exhausted=False,
+        )
         return page
+
+    def _wait_for_terminal_output(
+        self,
+        record: TerminalRecord,
+        *,
+        cursor: int,
+        wait_timeout_seconds: float,
+    ) -> None:
+        timeout = max(0.0, wait_timeout_seconds)
+        if timeout <= 0:
+            return
+
+        deadline = monotonic_now() + timeout
+        with record.lock:
+            while True:
+                if record.total_output_messages > cursor or record.done_event.is_set():
+                    return
+                remaining = deadline - monotonic_now()
+                if remaining <= 0:
+                    return
+                record.output_condition.wait(timeout=min(remaining, 0.1))
 
     def terminal_write(
         self,
         terminal_id: str,
         text: str,
         append_newline: bool = False,
-        wait_timeout_seconds: float = 0.2,
+        wait_timeout_seconds: float = 1.0,
         limit: int = DEFAULT_OUTPUT_PAGE_SIZE,
     ) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
@@ -1498,15 +1700,39 @@ class PythonTerminalExecutorV2:
                 "output": self.terminal_read(terminal_id, cursor=start_cursor, limit=limit),
             }
 
-        if wait_timeout_seconds > 0:
-            time.sleep(wait_timeout_seconds)
         return {
             "ok": True,
             "terminal_id": terminal_id,
             "bytes_written": bytes_written,
             "status": self.terminal_info(terminal_id).get("status"),
-            "output": self.terminal_read(terminal_id, cursor=start_cursor, limit=limit),
+            "output": self._terminal_read_after_write(
+                terminal_id=terminal_id,
+                cursor=start_cursor,
+                limit=limit,
+                wait_timeout_seconds=wait_timeout_seconds,
+            ),
         }
+
+    def _terminal_read_after_write(
+        self,
+        *,
+        terminal_id: str,
+        cursor: int,
+        limit: int,
+        wait_timeout_seconds: float,
+    ) -> dict[str, Any]:
+        record = self.terminals.get(terminal_id)
+        if record is None:
+            return {
+                "terminal_id": terminal_id,
+                "cursor": cursor,
+                "next_cursor": cursor,
+                "has_more": False,
+                "items": [],
+                "error_summary": "Terminal not found.",
+            }
+        self._wait_for_terminal_output(record, cursor=cursor, wait_timeout_seconds=wait_timeout_seconds)
+        return self.terminal_read(terminal_id, cursor=cursor, limit=limit, wait_for_output_seconds=0)
 
     def terminal_interrupt(self, terminal_id: str) -> bool:
         record = self.terminals.get(terminal_id)
@@ -1704,11 +1930,13 @@ if mcp is not None:
         terminal_id: Annotated[str, "Terminal ID returned by terminal_open()."],
         cursor: Annotated[Optional[int], "Output cursor from the previous page."] = None,
         limit: Annotated[Optional[int], "Maximum number of output entries to return."] = None,
+        wait_for_output_seconds: Annotated[Optional[float], "Optional time budget to wait for new terminal output before returning."] = None,
     ) -> dict[str, Any]:
         return python_terminal_executor_v2.terminal_read(
             terminal_id=terminal_id,
             cursor=cursor or 0,
             limit=limit or DEFAULT_OUTPUT_PAGE_SIZE,
+            wait_for_output_seconds=wait_for_output_seconds if wait_for_output_seconds is not None else DEFAULT_TERMINAL_READ_WAIT_SECONDS,
         )
 
 
@@ -1724,7 +1952,7 @@ if mcp is not None:
             terminal_id=terminal_id,
             text=text,
             append_newline=append_newline,
-            wait_timeout_seconds=wait_timeout_seconds or 0.2,
+            wait_timeout_seconds=wait_timeout_seconds or 1.0,
             limit=limit or DEFAULT_OUTPUT_PAGE_SIZE,
         )
 

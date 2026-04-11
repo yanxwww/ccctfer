@@ -10,13 +10,14 @@ ARG USER_GID=1000
 ARG USER_HOME=/home/${USERNAME}
 ARG APP_HOME=${USER_HOME}/python-terminal-mcp
 ARG WORKSPACE_DIR=${USER_HOME}/workspace
-ARG PIP_INDEX_URL
-ARG PIP_EXTRA_INDEX_URL
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_EXTRA_INDEX_URL=
 
 ENV HOME=${USER_HOME} \
     APP_HOME=${APP_HOME} \
     WORKSPACE_DIR=${WORKSPACE_DIR} \
     PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -59,7 +60,7 @@ RUN python3 -m venv "${APP_HOME}/.venv" \
     && install_args=(--no-cache-dir --prefer-binary) \
     && if [ -n "${PIP_INDEX_URL:-}" ]; then install_args+=(--index-url "${PIP_INDEX_URL}"); fi \
     && if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then install_args+=(--extra-index-url "${PIP_EXTRA_INDEX_URL}"); fi \
-    && "${APP_HOME}/.venv/bin/pip" install "${install_args[@]}" --upgrade pip setuptools wheel \
+    && "${APP_HOME}/.venv/bin/pip" --version \
     && "${APP_HOME}/.venv/bin/pip" install "${install_args[@]}" -r "${APP_HOME}/requirements.txt" \
     && ln -sf "${APP_HOME}/.venv/bin/pip" /usr/local/bin/pip \
     && mkdir -p "${PYTHON_TERMINAL_MCP_RUNTIME_DIR}" "${WORKSPACE_DIR}" \

@@ -86,7 +86,7 @@ ANTHROPIC_MODEL=your-model
 python3 run_task.py
 ```
 
-默认会给 main agent 开启 `submit_flag` / `view_hint` / `stop_challenge` 对应的比赛平台 MCP 集成，因此需要确保 `.env` 或当前 shell 中同时存在：
+默认会给 main agent 开启 `submit_flag` / `view_hint` 对应的比赛平台 MCP 集成，因此需要确保 `.env` 或当前 shell 中同时存在：
 
 - `SERVER_HOST`：比赛平台主机或其 `/api`、`/mcp` 地址
 - `AGENT_TOKEN`
