@@ -1,4 +1,5 @@
-FROM issyy/ccctfer:latest
+# FROM issyy/ccctfer:latest
+FROM issyy/xbow-kail:latest 
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -9,10 +10,14 @@ ARG USER_GID=1000
 ARG USER_HOME=/home/${USERNAME}
 ARG APP_HOME=${USER_HOME}/python-terminal-mcp
 ARG WORKSPACE_DIR=${USER_HOME}/workspace
+ARG PIP_INDEX_URL
+ARG PIP_EXTRA_INDEX_URL
 
 ENV HOME=${USER_HOME} \
     APP_HOME=${APP_HOME} \
     WORKSPACE_DIR=${WORKSPACE_DIR} \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHON_TERMINAL_MCP_ROOT=${APP_HOME} \
@@ -51,8 +56,11 @@ COPY requirements.txt ${APP_HOME}/requirements.txt
 COPY app/ ${APP_HOME}/app/
 
 RUN python3 -m venv "${APP_HOME}/.venv" \
-    && "${APP_HOME}/.venv/bin/pip" install --no-cache-dir --upgrade pip \
-    && "${APP_HOME}/.venv/bin/pip" install --no-cache-dir -r "${APP_HOME}/requirements.txt" \
+    && install_args=(--no-cache-dir --prefer-binary) \
+    && if [ -n "${PIP_INDEX_URL:-}" ]; then install_args+=(--index-url "${PIP_INDEX_URL}"); fi \
+    && if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then install_args+=(--extra-index-url "${PIP_EXTRA_INDEX_URL}"); fi \
+    && "${APP_HOME}/.venv/bin/pip" install "${install_args[@]}" --upgrade pip setuptools wheel \
+    && "${APP_HOME}/.venv/bin/pip" install "${install_args[@]}" -r "${APP_HOME}/requirements.txt" \
     && ln -sf "${APP_HOME}/.venv/bin/pip" /usr/local/bin/pip \
     && mkdir -p "${PYTHON_TERMINAL_MCP_RUNTIME_DIR}" "${WORKSPACE_DIR}" \
     && chown -R "${USERNAME}:${USERNAME}" "${USER_HOME}"

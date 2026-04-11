@@ -8,7 +8,7 @@
 
 - 使用 `Read` / `Grep` / `Glob` 读取规范输入、规范报告，以及被规范报告明确引用的 artifact
 - 使用 `Task` 调用 subagent（运行日志中也可能显示为 `Agent`）
-- 只有当 launcher 显式启用了 challenge MCP，且当前任务提示词明确声明可用时，才可以额外调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`
+- 只有当当前任务提示词明确声明 challenge MCP 可用时，才可以额外调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`
 - 审核 `.inputs/challenge.json`、`reports/observation_report.json`、必要时查看 `reports/observation_report_v*.json` 快照、`reports/exploitation/exploitation_report.json`、`reports/exploitation/exploitation_*.json`
 - 仅在明确进入最终落盘阶段后，才读取 `.results/flag.txt`、`.results/final_report.md`、`.results/blocker_report.md`
 - 基于证据决定下一步应该继续 observation、继续 exploitation，还是终止任务

@@ -4,7 +4,7 @@
 - 容器内启动 `python_terminal_mcp`（MCP 服务）
 - 使用 `run_task.py` 生成任务工作区并调用 `claude` 执行主流程
 - 通过受限工具集（`Task/Read/Grep/Glob` + `mcp__sandbox__*`）完成 observation/exploitation 流程
-- 可选通过 `--enable-challenge-mcp` 为 main agent 临时接入比赛平台 MCP（默认关闭）
+- 默认通过 challenge MCP 为 main agent 接入比赛平台工具；如需关闭，显式传入 `--disable-challenge-mcp`
 
 ## 项目结构
 
@@ -86,17 +86,17 @@ ANTHROPIC_MODEL=your-model
 python3 run_task.py
 ```
 
-如果比赛平台 MCP 已上线，并且希望只给 main agent 开启 `submit_flag` / `view_hint` / `stop_challenge`，可以显式加开关：
-
-```bash
-python3 run_task.py --enable-challenge-mcp
-```
-
-启用该开关时，需要确保 `.env` 或当前 shell 中同时存在：
+默认会给 main agent 开启 `submit_flag` / `view_hint` / `stop_challenge` 对应的比赛平台 MCP 集成，因此需要确保 `.env` 或当前 shell 中同时存在：
 
 - `SERVER_HOST`：比赛平台主机或其 `/api`、`/mcp` 地址
 - `AGENT_TOKEN`
 - `CHALLENGE_CODE`
+
+如果当前不是在比赛环境，或者暂时不希望接入比赛平台 MCP，可以显式关闭：
+
+```bash
+python3 run_task.py --disable-challenge-mcp
+```
 
 也可以指定参数：
 
@@ -147,7 +147,7 @@ workspace/0411-120000-demo/
 - 服务地址：`http://127.0.0.1:8000/mcp`（容器内）
 - 默认端口：`8000`
 - `run_task.py` 会生成并使用：`/home/kali/.claude/mcp.json`
-- 默认只包含本地 `sandbox` MCP；只有显式传入 `--enable-challenge-mcp` 时，才会追加远程 `platform` MCP
+- 默认包含本地 `sandbox` MCP 与远程 `platform` MCP；只有显式传入 `--disable-challenge-mcp` 时，才会只保留本地 `sandbox` MCP
 - 启动命令来自 `Dockerfile` 的 `CMD`，实际进程为：
 	- `/home/kali/python-terminal-mcp/.venv/bin/python /home/kali/python-terminal-mcp/app/python_terminal_mcp.py ...`
 

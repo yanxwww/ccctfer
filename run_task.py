@@ -137,9 +137,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional platform passed to docker run, for example linux/amd64.",
     )
     parser.add_argument(
-        "--enable-challenge-mcp",
-        action="store_true",
-        help="Enable competition challenge MCP integration for main agent only.",
+        "--disable-challenge-mcp",
+        action="store_false",
+        dest="enable_challenge_mcp",
+        default=True,
+        help="Disable competition challenge MCP integration; by default it is enabled for the main agent only.",
     )
     return parser.parse_args()
 
@@ -434,7 +436,7 @@ def build_prompt(challenge: dict[str, object]) -> str:
     if challenge_mcp_enabled:
         main_tools_text += "，以及 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`"
     challenge_mcp_rules = """
-- 只有在本次任务明确启用了 challenge MCP 时，你才可以亲自调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`。
+- 只有当本次任务提示词明确声明 challenge MCP 可用时，你才可以亲自调用 `mcp__platform__submit_flag`、`mcp__platform__view_hint`、`mcp__platform__stop_challenge`。
 - challenge MCP 工具只对你这个 main agent 开放；禁止把它们下放给任何 subagent。
 - 只有当 exploitation 带回了完整、可复核、来源明确的候选 `flag{...}` 后，你才可以亲自调用 `mcp__platform__submit_flag`。
 - 只有 `mcp__platform__submit_flag` 返回 `correct=true`，才允许认定“官方判定成功”；本地 `flag.txt`、`final_report.md`、候选片段、测试文件都不是官方成功信号。
