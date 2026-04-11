@@ -13,8 +13,16 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge incremental observation data into the canonical report.")
     parser.add_argument("--report", required=True, help="Path to reports/observation_report.json")
-    parser.add_argument("--update", required=True, help="Path to the current observation delta JSON")
-    return parser.parse_args()
+    parser.add_argument("--update", help="Path to the current observation delta JSON")
+    parser.add_argument(
+        "--repair-in-place",
+        action="store_true",
+        help="Coerce the current observation report into the canonical schema in place.",
+    )
+    args = parser.parse_args()
+    if not args.update and not args.repair_in_place:
+        parser.error("Either --update or --repair-in-place is required.")
+    return args
 
 
 def empty_report() -> dict[str, Any]:
@@ -46,6 +54,17 @@ def empty_report() -> dict[str, Any]:
         "unknowns": [],
         "recommended_next_step": {},
     }
+
+
+CANONICAL_ROOT_KEYS = {
+    "target",
+    "surface_map",
+    "evidence",
+    "hypotheses",
+    "negative_findings",
+    "unknowns",
+    "recommended_next_step",
+}
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -103,6 +122,289 @@ def normalize_scalar(value: Any) -> str:
             return normalize_url(value)
         return collapse_text(value)
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def ensure_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def is_canonical_report(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if not CANONICAL_ROOT_KEYS.issubset(value.keys()):
+        return False
+    if not isinstance(value.get("target"), dict):
+        return False
+    if not isinstance(value.get("surface_map"), dict):
+        return False
+    if not isinstance(value.get("evidence"), list):
+        return False
+    if not isinstance(value.get("hypotheses"), list):
+        return False
+    if not isinstance(value.get("negative_findings"), list):
+        return False
+    if not isinstance(value.get("unknowns"), list):
+        return False
+    if not isinstance(value.get("recommended_next_step"), dict):
+        return False
+    return True
+
+
+def add_note_evidence(report: dict[str, Any], *, note_type: str, source: str, summary: str, details: Any = None) -> None:
+    item: dict[str, Any] = {
+        "type": note_type,
+        "source": source,
+        "summary": collapse_text(summary),
+    }
+    if details not in (None, "", [], {}):
+        item["details"] = copy.deepcopy(details)
+    report["evidence"].append(item)
+
+
+def coerce_hypothesis(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        text = collapse_text(item)
+        if not text:
+            return None
+        return {"claim": text}
+
+    claim = collapse_text(item.get("claim") or item.get("description") or item.get("title") or item.get("summary"))
+    if not claim:
+        return None
+
+    hypothesis: dict[str, Any] = {"claim": claim}
+    if collapse_text(item.get("id")):
+        hypothesis["id"] = item["id"]
+    family = collapse_text(item.get("family") or item.get("type") or item.get("category") or item.get("vector"))
+    if family:
+        hypothesis["family"] = family
+    confidence = collapse_text(item.get("confidence"))
+    if confidence:
+        hypothesis["confidence"] = confidence
+    status = collapse_text(item.get("status"))
+    if status:
+        hypothesis["status"] = status
+
+    basis: list[str] = []
+    for key in ("basis", "evidence"):
+        value = item.get(key)
+        if isinstance(value, list):
+            basis.extend(collapse_text(entry) for entry in value if collapse_text(entry))
+        elif collapse_text(value):
+            basis.append(collapse_text(value))
+    if basis:
+        hypothesis["basis"] = list(dict.fromkeys(basis))
+
+    minimal_checks: list[str] = []
+    for key in ("minimal_checks", "next_steps", "recommendations"):
+        value = item.get(key)
+        if isinstance(value, list):
+            minimal_checks.extend(collapse_text(entry) for entry in value if collapse_text(entry))
+        elif collapse_text(value):
+            minimal_checks.append(collapse_text(value))
+    if minimal_checks:
+        hypothesis["minimal_checks"] = list(dict.fromkeys(minimal_checks))
+
+    notes = collapse_text(item.get("notes") or item.get("note"))
+    if notes:
+        hypothesis["notes"] = notes
+    return hypothesis
+
+
+def coerce_endpoint_record(path_value: Any, payload: Any) -> tuple[str, dict[str, Any]] | None:
+    if isinstance(payload, dict):
+        record = copy.deepcopy(payload)
+    else:
+        record = {}
+
+    path = normalize_path(path_value or record.get("path") or record.get("endpoint") or record.get("url"))
+    if not path:
+        return None
+
+    normalized: dict[str, Any] = {"path": path}
+    method = collapse_text(record.get("method") or "GET")
+    if method:
+        normalized["method"] = method.upper()
+
+    status_code = record.get("status_code", record.get("status"))
+    if status_code not in (None, ""):
+        normalized["status_code"] = status_code
+
+    for source_key, target_key in (
+        ("location", "location"),
+        ("server", "server"),
+        ("content_type", "content_type"),
+        ("content-length", "content_length"),
+        ("content_length", "content_length"),
+        ("title", "title"),
+        ("note", "note"),
+        ("description", "description"),
+    ):
+        value = collapse_text(record.get(source_key))
+        if value:
+            normalized[target_key] = value
+
+    kind = "api_endpoints" if path.startswith("/api") or "json" in collapse_text(record.get("content_type")).lower() else "pages"
+    return kind, normalized
+
+
+def extend_endpoints(report: dict[str, Any], value: Any) -> None:
+    if isinstance(value, dict):
+        for path, payload in value.items():
+            normalized = coerce_endpoint_record(path, payload)
+            if not normalized:
+                continue
+            bucket, record = normalized
+            report["surface_map"][bucket].append(record)
+    elif isinstance(value, list):
+        for item in value:
+            normalized = coerce_endpoint_record(None, item)
+            if not normalized:
+                continue
+            bucket, record = normalized
+            report["surface_map"][bucket].append(record)
+
+
+def coerce_to_canonical(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return empty_report()
+
+    report = empty_report()
+
+    for key in CANONICAL_ROOT_KEYS:
+        value = payload.get(key)
+        if key not in payload:
+            continue
+        if key in {"target", "surface_map", "recommended_next_step"} and isinstance(value, dict):
+            report[key] = copy.deepcopy(value)
+        elif key in {"evidence", "hypotheses", "negative_findings", "unknowns"} and isinstance(value, list):
+            report[key] = copy.deepcopy(value)
+
+    target_value = payload.get("target")
+    if isinstance(target_value, str):
+        normalized_target = normalize_path(target_value)
+        if normalized_target:
+            report["target"]["scope"].append(normalized_target)
+            report["target"]["entrypoints"].append(normalized_target)
+
+    if isinstance(target_value, dict):
+        for field in ("scope", "entrypoints", "ports", "technologies"):
+            report["target"][field] = merge_scalar_lists(
+                report["target"].get(field, []),
+                ensure_list(target_value.get(field)),
+                normalize_scalar if field == "ports" else (normalize_name if field == "technologies" else normalize_path),
+            )
+
+    findings = payload.get("findings") if isinstance(payload.get("findings"), dict) else {}
+
+    technologies = []
+    technologies.extend(ensure_list(payload.get("tech_stack")))
+    technologies.extend(ensure_list(findings.get("tech_stack")))
+    technologies.extend(ensure_list(payload.get("technologies")))
+    for technology in technologies:
+        text = collapse_text(technology)
+        if text:
+            report["target"]["technologies"].append(text)
+
+    extend_endpoints(report, payload.get("endpoints"))
+    extend_endpoints(report, findings.get("endpoints"))
+
+    for negative_group in (
+        payload.get("negative_findings"),
+        findings.get("negative_findings"),
+    ):
+        report["negative_findings"].extend(ensure_list(negative_group))
+
+    for artifact_group, source_name in (
+        (payload.get("artifacts"), "legacy.artifacts"),
+        (findings.get("artifacts"), "legacy.findings.artifacts"),
+    ):
+        for artifact in ensure_list(artifact_group):
+            if isinstance(artifact, dict):
+                path = collapse_text(artifact.get("path") or artifact.get("artifact") or artifact.get("file"))
+                summary = collapse_text(artifact.get("description") or artifact.get("summary") or path or "Legacy observation artifact")
+                add_note_evidence(report, note_type="artifact", source=source_name, summary=summary, details=artifact)
+            else:
+                text = collapse_text(artifact)
+                if text:
+                    add_note_evidence(report, note_type="artifact", source=source_name, summary=text)
+
+    for hypothesis_group in (
+        payload.get("hypotheses"),
+        findings.get("hypotheses"),
+    ):
+        for item in ensure_list(hypothesis_group):
+            normalized = coerce_hypothesis(item)
+            if normalized:
+                report["hypotheses"].append(normalized)
+
+    for list_key, source_name, note_type in (
+        ("known_facts", "legacy.findings.known_facts", "legacy_fact"),
+        ("technical_constraints", "legacy.findings.technical_constraints", "technical_constraint"),
+        ("tooling_issues", "legacy.findings.tooling_issues", "tooling_issue"),
+        ("blockers", "legacy.findings.blockers", "blocker"),
+    ):
+        for item in ensure_list(findings.get(list_key)):
+            if isinstance(item, dict):
+                summary = collapse_text(item.get("title") or item.get("description") or item.get("note") or json.dumps(item, ensure_ascii=False))
+                add_note_evidence(report, note_type=note_type, source=source_name, summary=summary, details=item)
+            else:
+                text = collapse_text(item)
+                if text:
+                    add_note_evidence(report, note_type=note_type, source=source_name, summary=text)
+
+    for key, source_name in (
+        ("status", "legacy.status"),
+        ("phase", "legacy.phase"),
+        ("generated_at", "legacy.generated_at"),
+        ("timestamp", "legacy.timestamp"),
+    ):
+        value = collapse_text(payload.get(key))
+        if value:
+            add_note_evidence(report, note_type="legacy_note", source=source_name, summary=value)
+
+    if isinstance(payload.get("metadata"), dict) and payload["metadata"]:
+        add_note_evidence(
+            report,
+            note_type="legacy_metadata",
+            source="legacy.metadata",
+            summary="Legacy observation metadata preserved during repair",
+            details=payload["metadata"],
+        )
+
+    recommended_next_step = payload.get("recommended_next_step")
+    if isinstance(recommended_next_step, dict):
+        report["recommended_next_step"] = copy.deepcopy(recommended_next_step)
+    else:
+        next_steps: list[str] = []
+        for key in ("recommendation", "recommended_next_step", "next_steps"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                next_steps.extend(collapse_text(item) for item in value if collapse_text(item))
+            elif collapse_text(value):
+                next_steps.append(collapse_text(value))
+        if not next_steps and isinstance(payload.get("summary"), dict):
+            summary_next_steps = payload["summary"].get("next_steps")
+            if isinstance(summary_next_steps, list):
+                next_steps.extend(collapse_text(item) for item in summary_next_steps if collapse_text(item))
+        if next_steps:
+            first_hypothesis_id = ""
+            for item in report["hypotheses"]:
+                hypothesis_id = collapse_text(item.get("id"))
+                if hypothesis_id:
+                    first_hypothesis_id = hypothesis_id
+                    break
+            report["recommended_next_step"] = {
+                "action": next_steps[0],
+                "notes": next_steps,
+                **({"priority_hypothesis": first_hypothesis_id} if first_hypothesis_id else {}),
+            }
+
+    return merge_report(empty_report(), report)
 
 
 def unique_list(items: list[Any], normalizer) -> list[Any]:
@@ -415,14 +717,18 @@ def merge_report(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
 def main() -> int:
     args = parse_args()
     report_path = Path(args.report)
-    update_path = Path(args.update)
+    existing = coerce_to_canonical(load_json(report_path) if report_path.exists() else empty_report())
 
-    existing = load_json(report_path) if report_path.exists() else empty_report()
+    if args.repair_in_place:
+        write_json(report_path, existing)
+        return 0
+
+    update_path = Path(args.update)
     update = load_json(update_path)
     if not isinstance(update, dict):
         raise SystemExit("Update payload must be a JSON object.")
 
-    merged = merge_report(existing, update)
+    merged = merge_report(existing, coerce_to_canonical(update))
     write_json(report_path, merged)
     return 0
 

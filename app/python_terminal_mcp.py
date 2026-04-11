@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import difflib
 import errno
 import hashlib
 import json
@@ -43,6 +44,7 @@ DEFAULT_TERMINAL_READ_WAIT_SECONDS = 1.0
 DEFAULT_MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
 DEFAULT_MAX_TERMINAL_READ_CALLS = 40
 TERMINAL_READ_BACKOFF_SECONDS = (1, 2, 4, 8)
+DEFAULT_MAX_TERMINAL_TOMBSTONES = 128
 
 
 def utcnow_iso() -> str:
@@ -164,6 +166,7 @@ class ExecutionRecord:
     last_output_at: str = field(default_factory=utcnow_iso)
     last_output_monotonic: float = field(default_factory=monotonic_now)
     interrupt_requested: bool = False
+    auto_output_cursor: int = 0
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -194,6 +197,7 @@ class ExecutionRecord:
                 "total_output_bytes": self.total_output_bytes,
                 "output_log_path": self.output_log_path,
                 "metadata_path": self.metadata_path,
+                "auto_output_cursor": self.auto_output_cursor,
             }
 
 
@@ -235,6 +239,7 @@ class TerminalRecord:
     read_call_count: int = 0
     consecutive_empty_reads: int = 0
     last_read_cursor: Optional[int] = None
+    auto_read_cursor: int = 0
     pty_master_fd: Optional[int] = field(default=None, repr=False)
     pty_slave_name: Optional[str] = None
     process: Any = field(default=None, repr=False)
@@ -278,6 +283,7 @@ class TerminalRecord:
                 "read_call_count": self.read_call_count,
                 "consecutive_empty_reads": self.consecutive_empty_reads,
                 "last_read_cursor": self.last_read_cursor,
+                "auto_read_cursor": self.auto_read_cursor,
             }
 
 
@@ -308,6 +314,7 @@ class PythonTerminalExecutorV2:
 
         self.runtimes_root = self.root_dir / "runtimes"
         self.executions_root = self.root_dir / "executions"
+        self.shell_executions_root = self.root_dir / "shell_exec"
         self.terminals_root = self.root_dir / "terminals"
         self.audit_log_path = self.root_dir / "audit" / "audit.jsonl"
         self.worker_script_path = Path(__file__).with_name("python_session_worker.py")
@@ -316,6 +323,8 @@ class PythonTerminalExecutorV2:
         self.sessions: dict[tuple[str, str], SessionRecord] = {}
         self.executions: dict[str, ExecutionRecord] = {}
         self.terminals: dict[str, TerminalRecord] = {}
+        self.closed_terminals: dict[str, dict[str, Any]] = {}
+        self._terminal_sequence = 0
         self._state_lock = threading.RLock()
         self._audit_lock = threading.Lock()
         self._signal_installed = False
@@ -327,11 +336,18 @@ class PythonTerminalExecutorV2:
         self.root_dir = Path(root_dir).resolve()
         self.runtimes_root = self.root_dir / "runtimes"
         self.executions_root = self.root_dir / "executions"
+        self.shell_executions_root = self.root_dir / "shell_exec"
         self.terminals_root = self.root_dir / "terminals"
         self.audit_log_path = self.root_dir / "audit" / "audit.jsonl"
         configured_workspace_dir = workspace_dir or os.environ.get("PYTHON_TERMINAL_MCP_WORKSPACE_DIR")
         self.shared_workspace_dir = Path(configured_workspace_dir).expanduser().resolve() if configured_workspace_dir else None
-        for path in (self.runtimes_root, self.executions_root, self.terminals_root, self.audit_log_path.parent):
+        for path in (
+            self.runtimes_root,
+            self.executions_root,
+            self.shell_executions_root,
+            self.terminals_root,
+            self.audit_log_path.parent,
+        ):
             path.mkdir(parents=True, exist_ok=True)
         if self.shared_workspace_dir is not None:
             self.shared_workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +368,120 @@ class PythonTerminalExecutorV2:
         ensure_parent(path)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, default=json_default) + "\n")
+
+    def _next_terminal_id(self) -> str:
+        with self._state_lock:
+            while True:
+                self._terminal_sequence += 1
+                candidate = f"term-{self._terminal_sequence:04d}"
+                if candidate not in self.terminals and candidate not in self.closed_terminals:
+                    return candidate
+
+    def _remember_closed_terminal(self, record: TerminalRecord, *, cleanup_reason: Optional[str] = None) -> None:
+        tombstone = {
+            "terminal_id": record.terminal_id,
+            "status": record.status,
+            "error_summary": record.error_summary,
+            "runtime_key": record.runtime_key,
+            "agent_id": record.agent_id,
+            "group_id": record.group_id,
+            "output_log_path": record.output_log_path,
+            "metadata_path": record.metadata_path,
+            "end_time": record.end_time,
+            "return_code": record.return_code,
+            "cleanup_reason": cleanup_reason,
+        }
+        with self._state_lock:
+            self.closed_terminals[record.terminal_id] = tombstone
+            while len(self.closed_terminals) > DEFAULT_MAX_TERMINAL_TOMBSTONES:
+                oldest_key = next(iter(self.closed_terminals))
+                self.closed_terminals.pop(oldest_key, None)
+
+    def _terminal_hint(self, terminal_id: str) -> tuple[Optional[str], Optional[dict[str, Any]], bool]:
+        with self._state_lock:
+            active_ids = list(self.terminals.keys())
+            closed_ids = list(self.closed_terminals.keys())
+            if terminal_id in self.closed_terminals:
+                return terminal_id, self.closed_terminals[terminal_id], False
+            if terminal_id in self.terminals:
+                record = self.terminals[terminal_id]
+                return terminal_id, {"status": record.status, "output_log_path": record.output_log_path}, True
+            matches = difflib.get_close_matches(terminal_id, active_ids + closed_ids, n=1, cutoff=0.72)
+            if not matches:
+                return None, None, False
+            match = matches[0]
+            if match in self.terminals:
+                record = self.terminals[match]
+                return match, {"status": record.status, "output_log_path": record.output_log_path}, True
+            return match, self.closed_terminals.get(match), False
+
+    def _terminal_missing_page(self, terminal_id: str, *, cursor: int) -> dict[str, Any]:
+        suggested_id, tombstone, suggested_active = self._terminal_hint(terminal_id)
+        suggestion_text = ""
+        if suggested_id and suggested_id != terminal_id:
+            if suggested_active:
+                suggestion_text = (
+                    f" Possible typo: the closest active terminal is `{suggested_id}`. "
+                    "If that is the intended terminal, retry once with that exact id."
+                )
+            else:
+                suggestion_text = (
+                    f" The closest known terminal is `{suggested_id}`, but it is already closed."
+                )
+        cleanup_reason = tombstone.get("cleanup_reason") if tombstone else None
+        cleanup_text = f" Cleanup reason: {cleanup_reason}." if cleanup_reason else ""
+        error_summary = (
+            "Terminal not found. This terminal_id is invalid or already closed; "
+            "do not retry the same terminal_id."
+            f"{suggestion_text}{cleanup_text}"
+        )
+        recommended_next_action = (
+            "If `did_you_mean_terminal_id` is present and active, retry once with that exact id; "
+            "otherwise open a new terminal once or stop and report a blocker."
+        )
+        page = {
+            "terminal_id": terminal_id,
+            "cursor": cursor,
+            "next_cursor": cursor,
+            "has_more": False,
+            "items": [],
+            "status": tombstone.get("status") if tombstone else "missing",
+            "output_log_path": tombstone.get("output_log_path") if tombstone else None,
+            "error_summary": error_summary,
+            "terminal_missing": True,
+            "retryable": False,
+            "should_abandon_terminal": True,
+            "recommended_next_action": recommended_next_action,
+        }
+        if suggested_id and suggested_id != terminal_id:
+            page["did_you_mean_terminal_id"] = suggested_id
+            page["did_you_mean_active"] = suggested_active
+        return page
+
+    def _terminal_unavailable_page(
+        self,
+        record: TerminalRecord,
+        *,
+        cursor: int,
+        error_summary: str,
+    ) -> dict[str, Any]:
+        return {
+            "terminal_id": record.terminal_id,
+            "cursor": cursor,
+            "next_cursor": cursor,
+            "has_more": False,
+            "items": [],
+            "status": record.status,
+            "output_log_path": record.output_log_path,
+            "error_summary": (
+                f"{error_summary} This terminal should be treated as unavailable; "
+                "do not keep retrying the same terminal_id."
+            ),
+            "terminal_missing": False,
+            "retryable": False,
+            "should_abandon_terminal": True,
+            "recommended_next_action": "Open a new terminal once if you still need shell access; otherwise stop and report the blocker.",
+        }
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         ensure_parent(path)
@@ -380,6 +510,11 @@ class PythonTerminalExecutorV2:
 
     def _execution_dir(self, execution_id: str) -> Path:
         path = self.executions_root / execution_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _shell_execution_dir(self, execution_id: str) -> Path:
+        path = self.shell_executions_root / execution_id
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -1157,22 +1292,184 @@ class PythonTerminalExecutorV2:
             }
         return record.to_public_dict()
 
-    def python_output(self, execution_id: str, cursor: int = 0, limit: int = DEFAULT_OUTPUT_PAGE_SIZE) -> dict[str, Any]:
+    def python_output(self, execution_id: str, cursor: Optional[int] = None, limit: int = DEFAULT_OUTPUT_PAGE_SIZE) -> dict[str, Any]:
         record = self.executions.get(execution_id)
+        effective_cursor = cursor if cursor is not None else 0
         if record is None:
             return {
                 "execution_id": execution_id,
-                "cursor": cursor,
-                "next_cursor": cursor,
+                "cursor": effective_cursor,
+                "next_cursor": effective_cursor,
                 "has_more": False,
                 "items": [],
                 "error_summary": "Execution not found.",
             }
-        page = self._load_output_page(Path(record.output_log_path), cursor=cursor, limit=limit)
+        with record.lock:
+            effective_cursor = cursor if cursor is not None else record.auto_output_cursor
+        page = self._load_output_page(Path(record.output_log_path), cursor=effective_cursor, limit=limit)
+        with record.lock:
+            if page["next_cursor"] > record.auto_output_cursor:
+                record.auto_output_cursor = page["next_cursor"]
         page["execution_id"] = execution_id
         page["status"] = record.status
         page["output_log_path"] = record.output_log_path
+        page["implicit_cursor_used"] = cursor is None
         return page
+
+    def shell_exec(
+        self,
+        agent_id: str,
+        command: str,
+        group_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        shell: str = "/bin/bash",
+        env: Optional[dict[str, str]] = None,
+        timeout_seconds: int = 60,
+    ) -> dict[str, Any]:
+        error = self._validate_agent_id(agent_id)
+        execution_id = uuid.uuid4().hex
+        start_time = utcnow_iso()
+        if error:
+            return {
+                "execution_id": execution_id,
+                "agent_id": agent_id,
+                "group_id": group_id,
+                "status": "failed",
+                "timed_out": False,
+                "return_code": None,
+                "start_time": start_time,
+                "end_time": utcnow_iso(),
+                "stdout": "",
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "error_summary": error,
+            }
+
+        runtime = self._ensure_runtime(agent_id, group_id)
+        effective_cwd = self._resolve_cwd(runtime, cwd)
+        shell_argv = shlex.split(shell or "/bin/bash")
+        if not shell_argv:
+            shell_argv = ["/bin/bash"]
+        argv = shell_argv + ["-lc", command]
+        env_map = dict(os.environ)
+        env_overrides = {str(key): str(value) for key, value in (env or {}).items()}
+        env_map.update(env_overrides)
+        try:
+            timeout = max(1, int(timeout_seconds))
+        except (TypeError, ValueError):
+            timeout = 60
+
+        execution_dir = self._shell_execution_dir(execution_id)
+        output_log_path = execution_dir / "outputs.jsonl"
+        metadata_path = execution_dir / "metadata.json"
+        self._audit(
+            "shell_execution_submitted",
+            execution_id=execution_id,
+            runtime_key=runtime.runtime_key,
+            agent_id=agent_id,
+            group_id=group_id,
+            cwd=effective_cwd,
+            timeout_seconds=timeout,
+        )
+
+        timed_out = False
+        return_code: Optional[int] = None
+        stdout: str | bytes | None = ""
+        stderr: str | bytes | None = ""
+        error_summary = ""
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=effective_cwd,
+                env=env_map,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return_code = completed.returncode
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            if return_code != 0:
+                error_summary = f"Command exited with status {return_code}."
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            error_summary = f"Command timed out after {timeout} seconds."
+        except Exception as exc:
+            stdout = ""
+            stderr = ""
+            error_summary = f"Failed to execute shell command: {exc!r}"
+
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+
+        stdout = stdout or ""
+        stderr = stderr or ""
+        end_time = utcnow_iso()
+        for stream_name, stream_text in (("stdout", stdout), ("stderr", stderr)):
+            if stream_text:
+                self._append_jsonl(
+                    output_log_path,
+                    {
+                        "timestamp": utcnow_iso(),
+                        "type": "stream",
+                        "name": stream_name,
+                        "text": stream_text,
+                    },
+                )
+
+        stdout_preview, stdout_truncated = self._summarize_tool_output_string(stdout)
+        stderr_preview, stderr_truncated = self._summarize_tool_output_string(stderr)
+        status = "timed_out" if timed_out else ("completed" if return_code == 0 else "failed")
+        metadata = {
+            "execution_id": execution_id,
+            "runtime_key": runtime.runtime_key,
+            "agent_id": agent_id,
+            "group_id": group_id,
+            "command": command,
+            "argv": argv,
+            "cwd": effective_cwd,
+            "status": status,
+            "timed_out": timed_out,
+            "return_code": return_code,
+            "start_time": start_time,
+            "end_time": end_time,
+            "stdout_bytes": len(stdout.encode("utf-8", errors="replace")),
+            "stderr_bytes": len(stderr.encode("utf-8", errors="replace")),
+            "output_log_path": str(output_log_path.resolve()),
+            "metadata_path": str(metadata_path.resolve()),
+            "error_summary": error_summary,
+        }
+        self._write_json(metadata_path, metadata)
+        self._audit(
+            "shell_execution_finished",
+            execution_id=execution_id,
+            runtime_key=runtime.runtime_key,
+            agent_id=agent_id,
+            group_id=group_id,
+            status=status,
+            return_code=return_code,
+            timed_out=timed_out,
+            stdout_bytes=metadata["stdout_bytes"],
+            stderr_bytes=metadata["stderr_bytes"],
+        )
+        return {
+            **metadata,
+            "stdout": stdout_preview,
+            "stderr": stderr_preview,
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "recommended_next_action": (
+                "If this timed out because the command needs interactive input or TTY control, retry with terminal_*; "
+                "otherwise keep using shell_exec with a narrower command or a larger bounded timeout."
+                if timed_out
+                else "Do not open an interactive terminal for this command unless you need TTY or follow-up interactive input."
+            ),
+        }
 
     def python_interrupt(self, execution_id: str) -> bool:
         record = self.executions.get(execution_id)
@@ -1413,7 +1710,7 @@ class PythonTerminalExecutorV2:
             }
 
         runtime = self._ensure_runtime(agent_id, group_id)
-        terminal_id = uuid.uuid4().hex
+        terminal_id = self._next_terminal_id()
         terminal_name = self._sanitize_name(name or f"terminal-{terminal_id[:8]}")
         wait_timeout = wait_timeout_seconds or self.wait_timeout_seconds
         hard_timeout = hard_timeout_seconds or self.hard_timeout_seconds
@@ -1510,33 +1807,35 @@ class PythonTerminalExecutorV2:
     def terminal_info(self, terminal_id: str) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
         if record is None:
+            page = self._terminal_missing_page(terminal_id, cursor=0)
             return {
                 "terminal_id": terminal_id,
-                "status": "failed",
-                "error_summary": "Terminal not found.",
+                "status": page.get("status", "failed"),
+                "error_summary": page["error_summary"],
                 "outputs": [],
                 "artifacts": [],
+                "retryable": page["retryable"],
+                "should_abandon_terminal": page["should_abandon_terminal"],
+                "terminal_missing": page["terminal_missing"],
+                "recommended_next_action": page["recommended_next_action"],
+                "did_you_mean_terminal_id": page.get("did_you_mean_terminal_id"),
+                "did_you_mean_active": page.get("did_you_mean_active"),
             }
         return record.to_public_dict()
 
     def terminal_read(
         self,
         terminal_id: str,
-        cursor: int = 0,
+        cursor: Optional[int] = None,
         limit: int = DEFAULT_OUTPUT_PAGE_SIZE,
         wait_for_output_seconds: float = DEFAULT_TERMINAL_READ_WAIT_SECONDS,
     ) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
+        effective_cursor = cursor if cursor is not None else 0
         if record is None:
-            return {
-                "terminal_id": terminal_id,
-                "cursor": cursor,
-                "next_cursor": cursor,
-                "has_more": False,
-                "items": [],
-                "error_summary": "Terminal not found.",
-            }
+            return self._terminal_missing_page(terminal_id, cursor=effective_cursor)
         with record.lock:
+            effective_cursor = cursor if cursor is not None else record.auto_read_cursor
             record.read_call_count += 1
             read_call_count = record.read_call_count
             if read_call_count > DEFAULT_MAX_TERMINAL_READ_CALLS:
@@ -1551,8 +1850,8 @@ class PythonTerminalExecutorV2:
                     runtime_key=record.runtime_key,
                     agent_id=record.agent_id,
                     group_id=record.group_id,
-                    cursor=cursor,
-                    next_cursor=cursor,
+                    cursor=effective_cursor,
+                    next_cursor=effective_cursor,
                     item_count=0,
                     read_call_count=read_call_count,
                     consecutive_empty_reads=record.consecutive_empty_reads,
@@ -1561,8 +1860,8 @@ class PythonTerminalExecutorV2:
                 )
                 return {
                     "terminal_id": terminal_id,
-                    "cursor": cursor,
-                    "next_cursor": cursor,
+                    "cursor": effective_cursor,
+                    "next_cursor": effective_cursor,
                     "has_more": False,
                     "items": [],
                     "status": record.status,
@@ -1574,19 +1873,21 @@ class PythonTerminalExecutorV2:
                     "read_budget_exhausted": True,
                     "error_summary": record.error_summary,
                 }
-        self._wait_for_terminal_output(record, cursor=cursor, wait_timeout_seconds=wait_for_output_seconds)
-        page = self._load_output_page(Path(record.output_log_path), cursor=cursor, limit=limit)
+        self._wait_for_terminal_output(record, cursor=effective_cursor, wait_timeout_seconds=wait_for_output_seconds)
+        page = self._load_output_page(Path(record.output_log_path), cursor=effective_cursor, limit=limit)
         with record.lock:
-            empty_same_cursor = not page["items"] and page["next_cursor"] == cursor
+            empty_same_cursor = not page["items"] and page["next_cursor"] == effective_cursor
             if empty_same_cursor:
-                if record.last_read_cursor == cursor:
+                if record.last_read_cursor == effective_cursor:
                     record.consecutive_empty_reads += 1
                 else:
                     record.consecutive_empty_reads = 1
-                record.last_read_cursor = cursor
+                record.last_read_cursor = effective_cursor
             else:
                 record.consecutive_empty_reads = 0
                 record.last_read_cursor = page["next_cursor"]
+                if page["next_cursor"] > record.auto_read_cursor:
+                    record.auto_read_cursor = page["next_cursor"]
 
             consecutive_empty_reads = record.consecutive_empty_reads
             should_stop_polling = consecutive_empty_reads >= DEFAULT_MAX_CONSECUTIVE_EMPTY_TERMINAL_READS
@@ -1611,6 +1912,7 @@ class PythonTerminalExecutorV2:
         page["recommended_wait_seconds"] = recommended_wait_seconds
         page["should_stop_polling"] = should_stop_polling
         page["read_budget_exhausted"] = False
+        page["implicit_cursor_used"] = cursor is None
         if should_stop_polling:
             page["error_summary"] = record.error_summary
         self._audit(
@@ -1619,7 +1921,7 @@ class PythonTerminalExecutorV2:
             runtime_key=record.runtime_key,
             agent_id=record.agent_id,
             group_id=record.group_id,
-            cursor=cursor,
+            cursor=effective_cursor,
             next_cursor=page["next_cursor"],
             item_count=len(page["items"]),
             read_call_count=read_call_count,
@@ -1654,18 +1956,25 @@ class PythonTerminalExecutorV2:
         self,
         terminal_id: str,
         text: str,
-        append_newline: bool = False,
+        append_newline: bool = True,
         wait_timeout_seconds: float = 1.0,
         limit: int = DEFAULT_OUTPUT_PAGE_SIZE,
     ) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
         if record is None:
+            page = self._terminal_missing_page(terminal_id, cursor=0)
             return {
                 "ok": False,
                 "terminal_id": terminal_id,
                 "bytes_written": 0,
-                "error_summary": "Terminal not found.",
-                "output": {"items": [], "cursor": 0, "next_cursor": 0, "has_more": False},
+                "error_summary": page["error_summary"],
+                "retryable": page["retryable"],
+                "should_abandon_terminal": page["should_abandon_terminal"],
+                "terminal_missing": page["terminal_missing"],
+                "recommended_next_action": page["recommended_next_action"],
+                "did_you_mean_terminal_id": page.get("did_you_mean_terminal_id"),
+                "did_you_mean_active": page.get("did_you_mean_active"),
+                "output": page,
             }
         payload = text + ("\n" if append_newline else "")
         with record.lock:
@@ -1673,31 +1982,50 @@ class PythonTerminalExecutorV2:
             proc = record.process
             fd = record.pty_master_fd
         if proc is None or proc.poll() is not None:
+            page = self._terminal_unavailable_page(record, cursor=start_cursor, error_summary="Terminal is not running.")
             return {
                 "ok": False,
                 "terminal_id": terminal_id,
                 "bytes_written": 0,
-                "error_summary": "Terminal is not running.",
-                "output": self.terminal_read(terminal_id, cursor=start_cursor, limit=limit),
+                "error_summary": page["error_summary"],
+                "retryable": page["retryable"],
+                "should_abandon_terminal": page["should_abandon_terminal"],
+                "terminal_missing": page["terminal_missing"],
+                "recommended_next_action": page["recommended_next_action"],
+                "output": page,
             }
 
         try:
             if fd is None:
+                page = self._terminal_unavailable_page(record, cursor=start_cursor, error_summary="Terminal PTY is unavailable.")
                 return {
                     "ok": False,
                     "terminal_id": terminal_id,
                     "bytes_written": 0,
-                    "error_summary": "Terminal PTY is unavailable.",
-                    "output": self.terminal_read(terminal_id, cursor=start_cursor, limit=limit),
+                    "error_summary": page["error_summary"],
+                    "retryable": page["retryable"],
+                    "should_abandon_terminal": page["should_abandon_terminal"],
+                    "terminal_missing": page["terminal_missing"],
+                    "recommended_next_action": page["recommended_next_action"],
+                    "output": page,
                 }
             bytes_written = os.write(fd, payload.encode("utf-8", errors="replace"))
         except Exception as exc:
+            page = self._terminal_unavailable_page(
+                record,
+                cursor=start_cursor,
+                error_summary=f"Failed to write terminal input: {exc!r}",
+            )
             return {
                 "ok": False,
                 "terminal_id": terminal_id,
                 "bytes_written": 0,
-                "error_summary": f"Failed to write terminal input: {exc!r}",
-                "output": self.terminal_read(terminal_id, cursor=start_cursor, limit=limit),
+                "error_summary": page["error_summary"],
+                "retryable": page["retryable"],
+                "should_abandon_terminal": page["should_abandon_terminal"],
+                "terminal_missing": page["terminal_missing"],
+                "recommended_next_action": page["recommended_next_action"],
+                "output": page,
             }
 
         return {
@@ -1723,14 +2051,7 @@ class PythonTerminalExecutorV2:
     ) -> dict[str, Any]:
         record = self.terminals.get(terminal_id)
         if record is None:
-            return {
-                "terminal_id": terminal_id,
-                "cursor": cursor,
-                "next_cursor": cursor,
-                "has_more": False,
-                "items": [],
-                "error_summary": "Terminal not found.",
-            }
+            return self._terminal_missing_page(terminal_id, cursor=cursor)
         self._wait_for_terminal_output(record, cursor=cursor, wait_timeout_seconds=wait_timeout_seconds)
         return self.terminal_read(terminal_id, cursor=cursor, limit=limit, wait_for_output_seconds=0)
 
@@ -1817,6 +2138,8 @@ class PythonTerminalExecutorV2:
             self.terminal_close(terminal_id, force=True if force else False)
             record = self.terminals.get(terminal_id)
             if force or record is None or record.status != "running":
+                if record is not None:
+                    self._remember_closed_terminal(record, cleanup_reason="runtime_cleaned_up")
                 self.terminals.pop(terminal_id, None)
 
         self.runtimes.pop(runtime_key, None)
@@ -1869,7 +2192,7 @@ if mcp is not None:
     ) -> dict[str, Any]:
         return python_terminal_executor_v2.python_output(
             execution_id=execution_id,
-            cursor=cursor or 0,
+            cursor=cursor,
             limit=limit or DEFAULT_OUTPUT_PAGE_SIZE,
         )
 
@@ -1898,8 +2221,32 @@ if mcp is not None:
 
 
     @mcp.tool(output_schema=None)
-    def terminal_open(
+    def shell_exec(
         agent_id: Annotated[str, "Required isolated agent ID."],
+        command: Annotated[
+            str,
+            "Run one non-interactive shell command. Prefer this over terminal_* for ordinary commands; use terminal_* only when TTY/interactive control is required.",
+        ],
+        group_id: Annotated[Optional[str], "Optional explicit shared runtime group ID."] = None,
+        cwd: Annotated[Optional[str], "Working directory. Relative paths resolve under the runtime workspace."] = None,
+        shell: Annotated[str, "Shell executable used as '<shell> -lc <command>'."] = "/bin/bash",
+        env: Annotated[Optional[dict[str, str]], "Additional environment variables for this command only."] = None,
+        timeout_seconds: Annotated[int, "Maximum seconds before timing out the command."] = 60,
+    ) -> dict[str, Any]:
+        return python_terminal_executor_v2.shell_exec(
+            agent_id=agent_id,
+            command=command,
+            group_id=group_id,
+            cwd=cwd,
+            shell=shell,
+            env=env,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+    @mcp.tool(output_schema=None)
+    def terminal_open(
+        agent_id: Annotated[str, "Required isolated agent ID. Use terminal_open only after python_exec/shell_exec cannot handle a task that clearly needs TTY or interactive control."],
         name: Annotated[Optional[str], "Optional display name for this terminal."] = None,
         group_id: Annotated[Optional[str], "Optional explicit shared runtime group ID."] = None,
         cwd: Annotated[Optional[str], "Working directory. Relative paths resolve under the runtime workspace."] = None,
@@ -1921,20 +2268,28 @@ if mcp is not None:
 
 
     @mcp.tool(output_schema=None)
-    def terminal_info(terminal_id: Annotated[str, "Terminal ID returned by terminal_open()."]) -> dict[str, Any]:
+    def terminal_info(
+        terminal_id: Annotated[
+            str,
+            "Terminal ID returned by terminal_open(). If the response says terminal_missing=true or should_abandon_terminal=true, do not reuse that terminal_id.",
+        ]
+    ) -> dict[str, Any]:
         return python_terminal_executor_v2.terminal_info(terminal_id)
 
 
     @mcp.tool(output_schema=None)
     def terminal_read(
-        terminal_id: Annotated[str, "Terminal ID returned by terminal_open()."],
+        terminal_id: Annotated[
+            str,
+            "Terminal ID returned by terminal_open(). If the response says terminal_missing=true or should_abandon_terminal=true, stop reusing that terminal_id.",
+        ],
         cursor: Annotated[Optional[int], "Output cursor from the previous page."] = None,
         limit: Annotated[Optional[int], "Maximum number of output entries to return."] = None,
         wait_for_output_seconds: Annotated[Optional[float], "Optional time budget to wait for new terminal output before returning."] = None,
     ) -> dict[str, Any]:
         return python_terminal_executor_v2.terminal_read(
             terminal_id=terminal_id,
-            cursor=cursor or 0,
+            cursor=cursor,
             limit=limit or DEFAULT_OUTPUT_PAGE_SIZE,
             wait_for_output_seconds=wait_for_output_seconds if wait_for_output_seconds is not None else DEFAULT_TERMINAL_READ_WAIT_SECONDS,
         )
@@ -1942,9 +2297,15 @@ if mcp is not None:
 
     @mcp.tool(output_schema=None)
     def terminal_write(
-        terminal_id: Annotated[str, "Terminal ID returned by terminal_open()."],
+        terminal_id: Annotated[
+            str,
+            "Terminal ID returned by terminal_open(). Copy it exactly; if the response says terminal_missing=true or should_abandon_terminal=true, do not retry the same terminal_id.",
+        ],
         text: Annotated[str, "Text to write to the terminal PTY."],
-        append_newline: Annotated[bool, "Append a trailing newline before sending."] = False,
+        append_newline: Annotated[
+            bool,
+            "Append a trailing newline before sending. Defaults to true so each write is submitted as one complete shell input; set false only for deliberate partial interactive input.",
+        ] = True,
         wait_timeout_seconds: Annotated[Optional[float], "How long to wait after writing before reading fresh output."] = None,
         limit: Annotated[Optional[int], "Maximum number of output chunks to return."] = None,
     ) -> dict[str, Any]:

@@ -128,7 +128,8 @@ workspace/0411-120000-demo/
 ├── reports/
 │   ├── observation_report.json
 │   └── exploitation/
-│       └── exploitation_report.json (或 exploitation_*.json)
+│       ├── exploitation_report.json
+│       └── exploitation_<slug>.json
 ├── .artifacts/
 │   ├── observation/
 │   └── exploitation/
@@ -155,6 +156,12 @@ workspace/0411-120000-demo/
 - `.results/` 主要放规范结果产物，不要求每次都必须有 `final_report.md` 或 `blocker_report.md`
 - 若 agent 明确完成最终落盘，会写入 `flag.txt`、`final_report.md` 或 `blocker_report.md`
 - `run_task.py` 不再额外保存 Claude CLI 全量输出；审计与过程日志以 `.claude/`、`runtime_v2/`、`reports/` 为主
+
+## Exploitation 报告结构
+
+- `reports/exploitation/exploitation_report.json`：轻量总表，只保留每个向量的摘要、状态、路径和下一步建议
+- `reports/exploitation/exploitation_<slug>.json`：单个 exploitation 向量的详细报告
+- main agent 默认先读总表，只有在需要复核某个向量时才按需读取对应 detail JSON
 
 ## 常见问题
 
