@@ -1,5 +1,13 @@
+ARG FFUF_VERSION=2.1.0
+ARG HTTPX_VERSION=1.9.0
+ARG KATANA_VERSION=1.5.0
+ARG DALFOX_VERSION=2.12.0
+ARG ARJUN_VERSION=2.2.7
+ARG GOPROXY=https://goproxy.cn,direct
+ARG GOSUMDB=off
+
 # FROM issyy/ccctfer:latest
-FROM issyy/xbow-kail:latest 
+FROM issyy/xbow-kail:latest
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -12,11 +20,13 @@ ARG APP_HOME=${USER_HOME}/python-terminal-mcp
 ARG WORKSPACE_DIR=${USER_HOME}/workspace
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_EXTRA_INDEX_URL=
-ARG FFUF_VERSION=2.1.0
-ARG HTTPX_VERSION=1.9.0
-ARG KATANA_VERSION=1.5.0
-ARG DALFOX_VERSION=2.12.0
-ARG ARJUN_VERSION=2.2.7
+ARG ARJUN_VERSION
+ARG FFUF_VERSION
+ARG HTTPX_VERSION
+ARG KATANA_VERSION
+ARG DALFOX_VERSION
+ARG GOPROXY
+ARG GOSUMDB
 
 ENV HOME=${USER_HOME} \
     APP_HOME=${APP_HOME} \
@@ -76,31 +86,38 @@ RUN python3 -m venv "${APP_HOME}/.venv" \
     && chown -R "${USERNAME}:${USERNAME}" "${USER_HOME}"
 
 RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends golang-go; \
     arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
     case "${arch}" in \
         amd64|arm64) ;; \
         *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; \
     esac; \
-    tmpdir="$(mktemp -d)"; \
-    trap 'rm -rf "${tmpdir}"' EXIT; \
-    curl -fsSL "https://github.com/ffuf/ffuf/releases/download/v${FFUF_VERSION}/ffuf_${FFUF_VERSION}_linux_${arch}.tar.gz" -o "${tmpdir}/ffuf.tar.gz"; \
-    tar -xzf "${tmpdir}/ffuf.tar.gz" -C "${tmpdir}"; \
-    install -m 0755 "${tmpdir}/ffuf" /usr/local/bin/ffuf; \
-    curl -fsSL "https://github.com/projectdiscovery/httpx/releases/download/v${HTTPX_VERSION}/httpx_${HTTPX_VERSION}_linux_${arch}.zip" -o "${tmpdir}/httpx.zip"; \
-    unzip -q "${tmpdir}/httpx.zip" -d "${tmpdir}/httpx"; \
-    install -m 0755 "${tmpdir}/httpx/httpx" "${APP_HOME}/.venv/bin/httpx"; \
-    install -m 0755 "${tmpdir}/httpx/httpx" /usr/local/bin/httpx; \
-    curl -fsSL "https://github.com/projectdiscovery/katana/releases/download/v${KATANA_VERSION}/katana_${KATANA_VERSION}_linux_${arch}.zip" -o "${tmpdir}/katana.zip"; \
-    unzip -q "${tmpdir}/katana.zip" -d "${tmpdir}/katana"; \
-    install -m 0755 "${tmpdir}/katana/katana" /usr/local/bin/katana; \
-    curl -fsSL "https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VERSION}/dalfox-linux-${arch}.tar.gz" -o "${tmpdir}/dalfox.tar.gz"; \
-    tar -xzf "${tmpdir}/dalfox.tar.gz" -C "${tmpdir}"; \
-    install -m 0755 "${tmpdir}/dalfox-linux-${arch}" /usr/local/bin/dalfox; \
-    ffuf -V >/dev/null; \
-    httpx -version >/dev/null; \
-    katana -version >/dev/null; \
-    dalfox version >/dev/null; \
-    chown -R "${USERNAME}:${USERNAME}" "${USER_HOME}"
+    export GO111MODULE=on; \
+    export GOOS=linux; \
+    export GOARCH="${arch}"; \
+    export CGO_ENABLED=0; \
+    export GOPROXY="${GOPROXY}"; \
+    export GOSUMDB="${GOSUMDB}"; \
+    export GOBIN=/tmp/go-tools/bin; \
+    mkdir -p "${GOBIN}"; \
+    go install github.com/ffuf/ffuf/v2@v${FFUF_VERSION}; \
+    go install -v github.com/projectdiscovery/httpx/cmd/httpx@v${HTTPX_VERSION}; \
+    export CGO_ENABLED=1; \
+    go install github.com/projectdiscovery/katana/cmd/katana@v${KATANA_VERSION}; \
+    export CGO_ENABLED=0; \
+    go install github.com/hahwul/dalfox/v2@v${DALFOX_VERSION}; \
+    install -m 0755 "${GOBIN}/ffuf" /usr/local/bin/ffuf; \
+    install -m 0755 "${GOBIN}/httpx" /usr/local/bin/httpx; \
+    install -m 0755 "${GOBIN}/katana" /usr/local/bin/katana; \
+    install -m 0755 "${GOBIN}/dalfox" /usr/local/bin/dalfox; \
+    install -m 0755 "${GOBIN}/httpx" "${APP_HOME}/.venv/bin/httpx"; \
+    ffuf -V >/dev/null \
+    && httpx -version >/dev/null \
+    && HOME=/tmp katana -version >/dev/null \
+    && dalfox version >/dev/null; \
+    apt-get purge -y --auto-remove golang-go; \
+    rm -rf /var/lib/apt/lists/* /tmp/go-tools /root/go /root/.cache/go-build
 
 RUN npm install -g ccusage \
     && ccusage --version >/dev/null
