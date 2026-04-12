@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -57,8 +60,12 @@ MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
 MAX_TERMINAL_READ_CALLS = 40
 MAX_INLINE_TOOL_OUTPUT_BYTES = 4096
 MAX_INLINE_TOOL_OUTPUT_LINES = 20
+AGENT_ID_CAPTURE_POLL_INTERVAL_SECONDS = 0.25
 GRACEFUL_CLAUDE_INTERRUPT_SECONDS = 10
+GRACEFUL_CONTAINER_STOP_SECONDS = 5
 FLAG_PATTERN = re.compile(r"flag\{[^\r\n]+\}")
+CLAUDE_AGENT_ID_PATTERN = re.compile(r"\bagentId:\s*([A-Za-z0-9_-]+)")
+DETAIL_REPORT_PATH_PATTERN = re.compile(r"/home/kali/workspace/(reports/exploitation/exploitation_[^\s`\"')]+\.json)")
 CANONICAL_OBSERVATION_ROOT_KEYS = {
     "target",
     "surface_map",
@@ -83,6 +90,45 @@ CLAUDE_ENV_KEYS = [
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_MODEL",
 ]
+
+
+class GracefulShutdown(SystemExit):
+    """Raised from signal handlers so cleanup/finally blocks can still run."""
+
+    def __init__(self, sig: signal.Signals) -> None:
+        super().__init__(128 + sig.value)
+        self.signal = sig
+
+
+_shutdown_signal: signal.Signals | None = None
+_shutdown_in_cleanup = False
+
+
+def install_signal_handlers() -> dict[signal.Signals, object]:
+    global _shutdown_signal, _shutdown_in_cleanup
+
+    _shutdown_signal = None
+    _shutdown_in_cleanup = False
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def _handler(signum: int, _frame: object) -> None:
+        global _shutdown_signal
+        sig = signal.Signals(signum)
+        if _shutdown_signal is not None or _shutdown_in_cleanup:
+            print(f"[!] Already shutting down; ignoring additional {sig.name}.", file=sys.stderr)
+            return
+        _shutdown_signal = sig
+        raise GracefulShutdown(sig)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handler)
+    return previous_handlers
+
+
+def restore_signal_handlers(previous_handlers: dict[signal.Signals, object]) -> None:
+    for sig, handler in previous_handlers.items():
+        signal.signal(sig, handler)
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -336,6 +382,239 @@ def format_process_error(error: subprocess.CalledProcessError) -> str:
     if error.stdout:
         parts.append(error.stdout.strip())
     return "\n".join(part for part in parts if part).strip() or str(error)
+
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def normalize_workspace_relative_path(value: str) -> str:
+    text = str(value or "").strip()
+    prefix = "/home/kali/workspace/"
+    if text.startswith(prefix):
+        text = text[len(prefix) :]
+    return text
+
+
+def registry_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def lock_registry_file(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = registry_lock_path(path).open("a+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def load_registry_payload(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"observation_owner": {}, "exploitation_owners": []}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"observation_owner": {}, "exploitation_owners": []}
+    if not isinstance(payload, dict):
+        return {"observation_owner": {}, "exploitation_owners": []}
+    observation_owner = payload.get("observation_owner")
+    exploitation_owners = payload.get("exploitation_owners")
+    if not isinstance(observation_owner, dict):
+        observation_owner = {}
+    if not isinstance(exploitation_owners, list):
+        exploitation_owners = []
+    return {
+        "observation_owner": observation_owner,
+        "exploitation_owners": [item for item in exploitation_owners if isinstance(item, dict)],
+    }
+
+
+def write_registry_payload(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def derive_vector_slug_from_detail_report(detail_report: str) -> str:
+    stem = Path(detail_report).stem
+    if stem.startswith("exploitation_"):
+        stem = stem[len("exploitation_") :]
+    return stem or "unknown"
+
+
+def extract_detail_report_from_prompt(prompt_text: str) -> str:
+    match = DETAIL_REPORT_PATH_PATTERN.search(prompt_text or "")
+    return normalize_workspace_relative_path(match.group(1)) if match else ""
+
+
+def extract_agent_id_from_tool_result(tool_use_result: dict[str, object]) -> str:
+    direct = str(tool_use_result.get("agentId") or "").strip()
+    if direct:
+        return direct
+    for block in tool_use_result.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "text":
+            continue
+        match = CLAUDE_AGENT_ID_PATTERN.search(str(block.get("text") or ""))
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+def backfill_registry_owner_id(
+    task_dir: Path,
+    *,
+    role: str,
+    agent_id: str,
+    detail_report: str = "",
+) -> bool:
+    registry_path = task_dir / SUBAGENT_REGISTRY_RELATIVE_PATH
+    lock_handle = lock_registry_file(registry_path)
+    changed = False
+    try:
+        payload = load_registry_payload(registry_path)
+        timestamp = now_utc_iso()
+        if role == "observation-subagent":
+            observation_owner = payload.get("observation_owner")
+            if not isinstance(observation_owner, dict):
+                observation_owner = {}
+            if observation_owner.get("owner_id") != agent_id:
+                observation_owner["owner_id"] = agent_id
+                changed = True
+            if observation_owner.get("role") != "observation-subagent":
+                observation_owner["role"] = "observation-subagent"
+                changed = True
+            observation_owner["updated_at"] = timestamp
+            payload["observation_owner"] = observation_owner
+        elif role == "exploitation-subagent":
+            normalized_detail_report = normalize_workspace_relative_path(detail_report)
+            vector_slug = derive_vector_slug_from_detail_report(normalized_detail_report) if normalized_detail_report else ""
+            owners = payload.get("exploitation_owners")
+            if not isinstance(owners, list):
+                owners = []
+            matched_entry: dict[str, object] | None = None
+            for item in owners:
+                if not isinstance(item, dict):
+                    continue
+                same_detail = normalized_detail_report and normalize_workspace_relative_path(str(item.get("detail_report") or "")) == normalized_detail_report
+                same_vector_without_detail = vector_slug and not normalized_detail_report and str(item.get("vector_slug") or "").strip() == vector_slug
+                if same_detail or same_vector_without_detail:
+                    matched_entry = item
+                    break
+            if matched_entry is None:
+                matched_entry = {
+                    "role": "exploitation-subagent",
+                    "vector_slug": vector_slug or "unknown",
+                }
+                if normalized_detail_report:
+                    matched_entry["detail_report"] = normalized_detail_report
+                owners.append(matched_entry)
+                changed = True
+            if matched_entry.get("owner_id") != agent_id:
+                matched_entry["owner_id"] = agent_id
+                changed = True
+            if matched_entry.get("role") != "exploitation-subagent":
+                matched_entry["role"] = "exploitation-subagent"
+                changed = True
+            if normalized_detail_report and matched_entry.get("detail_report") != normalized_detail_report:
+                matched_entry["detail_report"] = normalized_detail_report
+                changed = True
+            if vector_slug and matched_entry.get("vector_slug") != vector_slug:
+                matched_entry["vector_slug"] = vector_slug
+                changed = True
+            matched_entry["updated_at"] = timestamp
+            payload["exploitation_owners"] = owners
+        if changed:
+            write_registry_payload(registry_path, payload)
+        return changed
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+class AgentIdCaptureWatcher:
+    def __init__(self, task_dir: Path, *, poll_interval_seconds: float = AGENT_ID_CAPTURE_POLL_INTERVAL_SECONDS) -> None:
+        self.task_dir = task_dir
+        self.projects_dir = task_dir / ".claude" / "projects"
+        self.poll_interval_seconds = poll_interval_seconds
+        self._offsets: dict[Path, int] = {}
+        self._seen: set[tuple[str, str, str, str]] = set()
+        self._captures = 0
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="agent-id-capture", daemon=True)
+
+    @property
+    def capture_count(self) -> int:
+        return self._captures
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, self.poll_interval_seconds * 4))
+        self.scan_once()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self.scan_once()
+            self._stop_event.wait(self.poll_interval_seconds)
+
+    def scan_once(self) -> None:
+        if not self.projects_dir.exists():
+            return
+        for path in sorted(self.projects_dir.rglob("*.jsonl")):
+            self._scan_file(path)
+
+    def _scan_file(self, path: Path) -> None:
+        previous_offset = self._offsets.get(path, 0)
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            return
+        if previous_offset > file_size:
+            previous_offset = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                handle.seek(previous_offset)
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        handle.seek(line_start)
+                        break
+                    self._process_line(path, line)
+                self._offsets[path] = handle.tell()
+        except OSError:
+            return
+
+    def _process_line(self, source_path: Path, raw_line: str) -> None:
+        try:
+            payload = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return
+        if payload.get("type") != "user":
+            return
+        tool_use_result = payload.get("toolUseResult")
+        if not isinstance(tool_use_result, dict):
+            return
+        role = str(tool_use_result.get("agentType") or "").strip()
+        if role not in {"observation-subagent", "exploitation-subagent"}:
+            return
+        agent_id = extract_agent_id_from_tool_result(tool_use_result)
+        if not agent_id:
+            return
+        prompt_text = str(tool_use_result.get("prompt") or "")
+        detail_report = extract_detail_report_from_prompt(prompt_text)
+        key = (str(source_path), role, agent_id, detail_report)
+        if key in self._seen:
+            return
+        if backfill_registry_owner_id(self.task_dir, role=role, agent_id=agent_id, detail_report=detail_report):
+            self._captures += 1
+        self._seen.add(key)
 
 
 def image_exists(image: str) -> bool:
@@ -726,31 +1005,45 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- 创建 subagent 时必须显式设置 `subagent_type` 为 `observation-subagent` 或 `exploitation-subagent`，不要使用泛型/default agent 执行 CTF 任务。",
         "- 给 subagent 的派单第一行必须写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`。",
         "- 不要在 subagent 派单里写“你是 main agent”“按照 main agent 状态机调度”等字样；`~/.claude/CLAUDE.md` 的 main-only 调度规则只由你使用。",
-        "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链必须优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",
+        "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链默认优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",
         "- 原则是：可以新开，但必须优先复用已有 owner；新开是兜底，不是默认动作。",
         "- main agent 的固定决策顺序是：先判断复用；复用不适合则判断替换；只有替换也不适合时才新开。",
-        "- 如果 `Agent` / `Task` tool_result 已返回 `agentId` 并提示可用 `SendMessage` 继续，把该 agent 视为这条链的默认 owner。",
-        "- 新建一个你预计会复用的 owner 后，尽快补一条极短 `SendMessage`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填给该 owner，让它写入 registry；否则 registry 只能防重复，不能稳定辅助恢复。",
+        "- 如果 `Agent` / `Task` tool_result 已返回 `agentId` 并提示可用 `SendMessage` 继续，把这个 `agentId` 视为这条链的默认 `owner_id`，它也是后续精确恢复该 owner 的默认 `SendMessage` 目标。",
+        "- 如果 `Agent` / `Task` tool_result 以文本形式出现 `agentId: <value>`，你必须直接提取这个字面值，并用 `SendMessage(to=<value>)`；不要声称“没看到 agentId”后再改走其它标识。",
+        "- `Agent` / `Task` tool_result 可能包含多个 text block；在判断“是否拿到 agentId”前，必须检查全部 text block，而不是只看第一个 checkpoint 摘要块。",
+        "- 每次 `Agent` / `Task` 返回后，你的下一步固定动作就是 owner capture：先检查全部 text block，字面提取 `agentId: <value>`，立刻把它当成当前链的 `owner_id`；如果 text block 里没拿到 `agentId`，立刻刷新一次 registry，launcher 可能已从结构化 `Agent` tool_result 回填 exact `owner_id`；在做完这一步之前，不要先去读报告、或继续派单。",
+        "- 一旦某个 text block 已出现 `agentId:`，不要再写“没看到 agentId”；直接使用该字面值推进 `SendMessage(to=<owner_id>)`。",
+        "- 如果 text block 没有 `agentId:`，但 registry 已出现当前链的 exact `owner_id`，直接使用 registry 里的值继续 `SendMessage`。",
+        "- 只有当你既没能从 `Agent` / `Task` tool_result、也没能从 registry 拿到 Claude `agentId` 时，才应明确报告 exact owner_id 当前不可用；不要改用 role alias、自定义 name、`mcp__sandbox__python_exec` / `shell_exec` / `list_agent_runtimes` 里的 `agent_id`、`runtime_key`、`member_agent_ids` 来凑 SendMessage 目标。",
+        "- `SendMessage` 使用的 exact `owner_id`，只认 `Agent` / `Task` tool_result 返回的 Claude subagent `agentId`；不要把 `mcp__sandbox__python_exec` / `shell_exec` / `list_agent_runtimes` 里的 `agent_id`、`runtime_key`、`member_agent_ids` 当成 SendMessage 目标。",
+        "- subagent 的 `name` / `summary` / 自定义别名，只能辅助阅读；它们不等于 exact owner_id，不应用作“已验证的精确恢复目标”。",
+        "- 新建一个你预计会复用的 owner 后，尽快补一条极短 `SendMessage(to=<owner_id>)`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填给该 owner，让它写入 registry；否则 registry 只能防重复，不能稳定辅助恢复。",
+        "- 向 `observation-subagent` / `exploitation-subagent` 这类 role alias 发消息，不算稳定复用具体 owner；同链续跑默认使用 exact `owner_id`，只有拿不到 `owner_id` 时才进入替换 / 新开判断。",
         "- 如果当前环境支持 Agent Teams / resume，owner 暂停时优先恢复原 owner；只有无法继续时才新开 agent。",
         "- `supplemental_observation` 默认优先 `SendMessage` 继续原 observation owner，而不是新开 observation sibling。",
+        "- 对 observation 的 initial checkpoint 或补一个具体事实这类窄任务，派单时要显式写出：`stage`、`vector_slug=observation`、helper 路径、停止条件，并要求 owner 尽量用一次自包含 `python_exec` 完成探测、artifact、update merge、registry 更新和最终 summary。",
         f"- `subagent registry` 是 owner 台账：创建或继续 subagent 前先读 `{subagent_registry_path}`；不要只靠临时记忆决定是否新开 sibling。",
         f"- 新建或继续 subagent 的派单里必须包含 `vector_slug`、目标 stage、status、detail 路径，并要求它用 `{subagent_registry_helper_path}` 在开始和结束时更新 registry。",
-        "- 同一 `vector_slug` / 同一 detail JSON 已有 owner 时，默认用 `SendMessage` 继续；只有 owner 明确不可恢复且继续收益高，才允许新开替代 agent。",
+        "- 同一 `vector_slug` / 同一 detail JSON 已有 exact `owner_id` 时，默认用 `SendMessage(to=<owner_id>)` 继续；只有 owner 明确不可恢复、`owner_id` 缺失、或继续收益明显更差时，才允许新开替代 agent。",
         "- observation 只允许一个长期 owner；如果 registry 或当前会话里已有 observation owner，默认继续它。",
-        "- 先做复用审查：同一 detail / 同一 hypothesis / 同一 vector_slug 是否已有 owner；当前任务是否只是原链路下一步、补证、deepen、bridge check。若是，优先继续原 owner。",
-        "- 若复用不适合，再做替换审查：只有旧 owner 明显上下文污染、上下文过厚、runtime 异常、连续漏关键点，或任务形态已改变时，才允许为同链路新开替代 owner。",
+        "- 先做复用审查：同一 detail / 同一 hypothesis / 同一 vector_slug 是否已有 exact `owner_id`；当前任务是否只是原链路下一步、补证、deepen、bridge check。若是，默认优先 `SendMessage(to=<owner_id>)` 继续原 owner。",
+        "- 若复用不适合，再做替换审查：只有旧 owner 明显上下文污染、上下文过厚、runtime 异常、连续漏关键点、`owner_id` 缺失无法精确恢复，或任务形态已改变时，才允许为同链路新开替代 owner。",
         "- 只有当任务本身是独立新链路，而不是原链路继续或替代时，才新开全新 `Agent`。",
         "- 任意时刻最多只允许 1 个 observation owner；只要它还能恢复，就禁止新开 observation sibling。",
         "- 如果 registry 显示活跃 exploitation owner 已达到并发上限，禁止继续新开 `Agent`；你只能先审阅已有结果、等待返回，或 `SendMessage` 续跑原 owner。",
         "- 在尚未读取任何一个新增 exploitation detail 报告前，不要连续新开超过 2 个 exploitation owner；先看结果，再决定下一批。",
         "- 对同一 endpoint / 同一 hypothesis / 同一 detail 链，默认只允许 1 个 active owner；只有原 owner 已明确证明存在正向 capability 且必须拆下一跳时，才允许分裂 sibling。",
-        "- 给 exploitation 派单时必须写清“只验证到哪一步就停止”；不要让 subagent 自行升级到更深验证。若你需要进一步探索，就用 `SendMessage` 唤醒同一 owner 并给新的窄任务说明。",
+        "- 给 exploitation 派单时必须写清“只验证到哪一步就停止”；不要让 subagent 自行升级到更深验证。若你需要进一步探索，默认先 `SendMessage(to=<owner_id>)` 唤醒同一 owner 并给新的窄任务说明；只有 owner 不适合继续时才替换或新开。",
         "- `summary.priority_actions` 是候选队列，不是自动派单列表；新开 exploitation 前先做一次轻量四因子判断：证据强度、独立性/链路契合、预期收益、预计成本。",
         "- 默认只并行高收益且低/中成本的前 1-2 个动作；高噪声枚举、大范围 brute force、需要消化大量正文的动作，除非能闭合一条 `ready_for_validation` / `in_progress` 组合链，否则不要占用默认并行位。",
         "- 如果当前同时存在 2 个彼此独立且高价值的 exploitation 动作，先把这 2 个都派出去；不要串行等第 1 个结束后才决定第 2 个，除非第 2 个确实依赖第 1 个结果。",
+        "- 先把候选 exploitation 按独立利用族分组（如上传 / 认证 / 模板 / 文件读 / 会话 / API 注入）；BFS 的目标是让不同利用族先各完成一轮首轮浅验证，而不是让同一利用族并发很多 payload 变体。",
         "- `targeted_exploitation` 起步优先做一轮广度优先的 initial exploitation wave：先让更多独立高价值向量完成首轮浅验证，再决定谁值得深挖。",
+        "- 首轮浅验证阶段，同一利用族默认只保留 1 个 active owner；不要在同一族里同时开多个 sibling 去做相似测试，除非 main 明确判定它们已经分化成独立链路。",
         "- 只要队列里还有尚未做首轮验证的高价值独立向量，就不要急着把并行位长期占给同一条链的深度 follow-up；优先补齐这些首轮 exploitation。",
         "- 只有当高价值独立向量的首轮验证基本完成，或某条链已出现强阳性信号并且再走一步就可能直接拿到 flag / file read / code exec 时，才优先深挖该链。",
+        "- 默认主流程是先 BFS、后 DFS：BFS 用来筛出每个独立利用族里最值得继续的链；DFS 只对最可行的 1-2 条链深入到 exploit / retrieval / flag。",
+        "- 进入 DFS 后，优先复用该链已有 owner；只有原 owner 不适合继续时才替换 owner，不要一进入深挖就机械新开 agent。",
         "- 漏洞测试默认采用 BFS / 渐进式策略：先做 existence check，再做 bridge check，最后才做 exploit / retrieval；目标是尽快排除错误路径、收敛正确路径，而不是一开始就把单个向量挖到最深。",
         "- observation 达到 checkpoint 后的停止表示“本轮暂停并交棒”，不是 observation 生命周期终止；但是否续跑必须重新过边界检查，而不是默认继续。",
         "- 只有当 exploitation detail 明确缺少一个具体事实、或 observation 主文件已记录一个边界清晰且与当前开放链直接相关的 bridge / surface 时，才继续原 observation owner。",
@@ -761,6 +1054,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- `failed` / `blocked` / `exhausted` 不是终判；若缺少前提、连接条件、触发点或观测证据，把它视为 `attempted_but_incomplete`，优先继续同一 owner。",
         "- main agent 自己不执行 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
         "- 派单时要要求 subagent：短/中任务优先一次性 `python_exec` + artifact / summary，不要默认后台执行后多次 `python_output` 轮询。",
+        "- observation checkpoint / supplemental fact 这类窄任务，不要让 owner 先探测完再慢慢收尾；优先要求它在同一次自包含 `python_exec` 里完成：收集 -> 写 artifact -> 写 update JSON -> merge 主文件 -> 更新 registry -> 打印最小 summary。",
         "- 非 finalization 阶段不读 `.results/*`；不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`。",
         "- 只能围绕 `challenge.json` 里的 entrypoint 及同 host 派单；除非 entrypoint 本身就是 localhost，否则不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标。",
         "- 容器内 `localhost:8000` 是 sandbox MCP 服务，不是 CTF 目标；如果 entrypoint 不可达，写 blocker / `needs_more_observation`，不要派单去扫描本地端口或 MCP 服务。",
@@ -902,7 +1196,8 @@ fi
 
 
 def stop_container(container_name: str) -> None:
-    run_command(["docker", "stop", "-t", "5", container_name], check=False)
+    run_command(["docker", "stop", "-t", str(GRACEFUL_CONTAINER_STOP_SECONDS), container_name], check=False)
+    run_command(["docker", "rm", "-f", container_name], check=False)
 
 
 def container_start_script() -> str:
@@ -1022,6 +1317,7 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False, agent_mod
 
 def run_claude_task(
     container_name: str,
+    task_dir: Path,
     prompt: str,
     timeout_seconds: int,
     *,
@@ -1039,6 +1335,8 @@ def run_claude_task(
         "-c",
         build_claude_shell_command(challenge_mcp_enabled=challenge_mcp_enabled, agent_mode=agent_mode),
     ]
+    watcher = AgentIdCaptureWatcher(task_dir)
+    watcher.start()
     process = subprocess.Popen(command, stdin=subprocess.PIPE, text=True)
     try:
         process.communicate(prompt, timeout=timeout_seconds)
@@ -1052,12 +1350,19 @@ def run_claude_task(
             process.communicate()
             return 124, True
         return process.returncode or 124, True
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted by user, stopping Claude...", file=sys.stderr)
+    except (KeyboardInterrupt, GracefulShutdown):
+        print("\n[!] Interrupt received, stopping Claude...", file=sys.stderr)
         interrupt_claude(container_name)
-        process.kill()
-        process.communicate()
-        return 130, False
+        try:
+            process.communicate(timeout=GRACEFUL_CLAUDE_INTERRUPT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        raise
+    finally:
+        watcher.stop()
+        if watcher.capture_count:
+            print(f"[+] Runner captured {watcher.capture_count} Claude subagent agentId(s) into registry.")
     return process.returncode or 0, False
 
 
@@ -1222,99 +1527,114 @@ def has_complete_final_results(task_dir: Path) -> tuple[bool, str | None]:
 
 
 def main() -> int:
-    args = parse_args()
-    ensure_image_exists(args.image, docker_platform=args.docker_platform)
-    runtime_env = load_runtime_env()
-    challenge = load_challenge(runtime_env, enable_challenge_mcp=args.enable_challenge_mcp)
+    global _shutdown_in_cleanup
 
-    workspace_root = (REPO_ROOT / args.workspace_root).resolve()
-    workspace_root.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%m%d-%H%M%S")
-    title_slug = slugify_title(str(challenge["challenge_title"]))
-    task_dir = workspace_root / f"{timestamp}-{title_slug}"
-    task_dir.mkdir(parents=True, exist_ok=False)
-    initialize_task_dirs(task_dir)
-    write_challenge_snapshot(task_dir, challenge)
-    initialize_workspace_claude_config(task_dir)
-    write_claude_mcp_config(task_dir, runtime_env, challenge)
-    ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
-    ensure_exploitation_report_index(task_dir)
-
-    container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}")
+    previous_signal_handlers = install_signal_handlers()
+    task_dir: Path | None = None
+    container_name = ""
     try:
-        run_command(build_run_command(args, container_name, task_dir, challenge, runtime_env))
-    except subprocess.CalledProcessError as error:
-        raise SystemExit(f"Failed to start container:\n{format_process_error(error)}") from error
+        args = parse_args()
+        ensure_image_exists(args.image, docker_platform=args.docker_platform)
+        runtime_env = load_runtime_env()
+        challenge = load_challenge(runtime_env, enable_challenge_mcp=args.enable_challenge_mcp)
 
-    print(f"[+] Task workspace: {task_dir}")
-    print(f"[+] Container: {container_name}")
+        workspace_root = (REPO_ROOT / args.workspace_root).resolve()
+        workspace_root.mkdir(parents=True, exist_ok=True)
 
-    exit_code = 1
-    try:
-        wait_for_mcp(container_name, args.ready_timeout_seconds, args.poll_interval_seconds)
-        verify_python_exec(container_name)
-        print("[+] MCP server and python_exec are ready, starting Claude task...")
-        prompt = build_prompt(challenge, agent_mode=args.agent_mode)
-        exit_code, timed_out = run_claude_task(
-            container_name,
-            prompt,
-            args.timeout_seconds,
-            challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
-            agent_mode=args.agent_mode,
-        )
-        repaired_observation = ensure_canonical_observation_report(task_dir, archive_noncanonical=True)
-        if repaired_observation:
-            print("[+] Repaired non-canonical observation report into canonical schema.")
-        if reconcile_exploitation_report_index(task_dir):
-            print("[+] Reconciled exploitation report index from detail reports.")
-        completed_with_results, final_flag = has_complete_final_results(task_dir)
-        if exit_code != 0 and not completed_with_results:
-            fallback_flag = auto_finalize_from_observation(task_dir, challenge)
-            if fallback_flag:
-                completed_with_results, final_flag = has_complete_final_results(task_dir)
-                if completed_with_results:
-                    if timed_out:
-                        print(
-                            f"[+] Claude task timed out before finalization, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
-                        )
-                    else:
-                        print(
-                            f"[+] Claude task exited with code {exit_code}, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
-                        )
-        if exit_code != 0 and completed_with_results:
-            if timed_out:
-                print(
-                    f"[+] Claude task timed out after finalization, but result files are complete; treating run as success ({final_flag})."
-                )
-            else:
-                print(f"[+] Claude task exited with code {exit_code}, but complete result files were found; treating run as success ({final_flag}).")
-            exit_code = 0
-        if exit_code == 0:
-            print("[+] Claude task completed.")
-        else:
-            print(f"[!] Claude task exited with code {exit_code}.", file=sys.stderr)
-        return exit_code
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted by user during setup.", file=sys.stderr)
-        exit_code = 130
-        return exit_code
-    finally:
-        if container_is_running(container_name):
-            print("[+] Writing token usage report...")
-            write_token_usage(container_name)
-            print("[+] Archiving Claude home for audit...")
-            archive_claude_home(container_name)
-        print("[+] Cleaning up container...")
-        stop_container(container_name)
+        timestamp = datetime.now().strftime("%m%d-%H%M%S")
+        title_slug = slugify_title(str(challenge["challenge_title"]))
+        task_dir = workspace_root / f"{timestamp}-{title_slug}"
+        task_dir.mkdir(parents=True, exist_ok=False)
+        initialize_task_dirs(task_dir)
+        write_challenge_snapshot(task_dir, challenge)
+        initialize_workspace_claude_config(task_dir)
+        write_claude_mcp_config(task_dir, runtime_env, challenge)
+        ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
+        ensure_exploitation_report_index(task_dir)
+
+        container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}")
         try:
+            run_command(build_run_command(args, container_name, task_dir, challenge, runtime_env))
+        except subprocess.CalledProcessError as error:
+            raise SystemExit(f"Failed to start container:\n{format_process_error(error)}") from error
+
+        print(f"[+] Task workspace: {task_dir}")
+        print(f"[+] Container: {container_name}")
+
+        exit_code = 1
+        try:
+            wait_for_mcp(container_name, args.ready_timeout_seconds, args.poll_interval_seconds)
+            verify_python_exec(container_name)
+            print("[+] MCP server and python_exec are ready, starting Claude task...")
+            prompt = build_prompt(challenge, agent_mode=args.agent_mode)
+            exit_code, timed_out = run_claude_task(
+                container_name,
+                task_dir,
+                prompt,
+                args.timeout_seconds,
+                challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
+                agent_mode=args.agent_mode,
+            )
+            repaired_observation = ensure_canonical_observation_report(task_dir, archive_noncanonical=True)
+            if repaired_observation:
+                print("[+] Repaired non-canonical observation report into canonical schema.")
             if reconcile_exploitation_report_index(task_dir):
                 print("[+] Reconciled exploitation report index from detail reports.")
-        except Exception as exc:
-            print(f"[!] Failed to reconcile exploitation report index: {exc}", file=sys.stderr)
-        print("[+] Normalizing workspace layout...")
-        sanitize_task_workspace(task_dir)
-        print(f"[+] Minimal artifacts kept under: {task_dir}")
+            completed_with_results, final_flag = has_complete_final_results(task_dir)
+            if exit_code != 0 and not completed_with_results:
+                fallback_flag = auto_finalize_from_observation(task_dir, challenge)
+                if fallback_flag:
+                    completed_with_results, final_flag = has_complete_final_results(task_dir)
+                    if completed_with_results:
+                        if timed_out:
+                            print(
+                                f"[+] Claude task timed out before finalization, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
+                            )
+                        else:
+                            print(
+                                f"[+] Claude task exited with code {exit_code}, but observation already contained one unique flag with evidence; launcher auto-finalized results ({final_flag})."
+                            )
+            if exit_code != 0 and completed_with_results:
+                if timed_out:
+                    print(
+                        f"[+] Claude task timed out after finalization, but result files are complete; treating run as success ({final_flag})."
+                    )
+                else:
+                    print(f"[+] Claude task exited with code {exit_code}, but complete result files were found; treating run as success ({final_flag}).")
+                exit_code = 0
+            if exit_code == 0:
+                print("[+] Claude task completed.")
+            else:
+                print(f"[!] Claude task exited with code {exit_code}.", file=sys.stderr)
+            return exit_code
+        except GracefulShutdown as exc:
+            print(f"\n[!] Received {exc.signal.name}, stopping task gracefully.", file=sys.stderr)
+            return 128 + exc.signal.value
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted by user, stopping task gracefully.", file=sys.stderr)
+            return 130
+        finally:
+            _shutdown_in_cleanup = True
+            if container_name and container_is_running(container_name):
+                print("[+] Writing token usage report...")
+                write_token_usage(container_name)
+                print("[+] Archiving Claude home for audit...")
+                archive_claude_home(container_name)
+            if container_name:
+                print("[+] Cleaning up container...")
+                stop_container(container_name)
+            if task_dir is not None:
+                try:
+                    if reconcile_exploitation_report_index(task_dir):
+                        print("[+] Reconciled exploitation report index from detail reports.")
+                except Exception as exc:
+                    print(f"[!] Failed to reconcile exploitation report index: {exc}", file=sys.stderr)
+                print("[+] Normalizing workspace layout...")
+                sanitize_task_workspace(task_dir)
+                print(f"[+] Minimal artifacts kept under: {task_dir}")
+    finally:
+        _shutdown_in_cleanup = False
+        restore_signal_handlers(previous_signal_handlers)
 
 
 if __name__ == "__main__":

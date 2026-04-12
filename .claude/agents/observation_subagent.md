@@ -126,6 +126,35 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 返回给 main agent
 - 不要继续在同一轮里做“顺手的额外侦察”
 
+## 窄任务 / checkpoint 收口
+
+如果当前派单是以下类型之一：
+
+- initial checkpoint
+- supplemental observation
+- 只补一个具体事实
+- 停止条件很短、边界很清晰的 observation 子任务
+
+默认优先使用**一次自包含的 `mcp__sandbox__python_exec`**完成整轮收口，而不是拆成很多步。
+
+这次 `python_exec` 应尽量在一次脚本里完成：
+
+1. 探测目标事实
+2. 写 artifact
+3. 生成本轮 `update.json`
+4. 用 `manage_observation_report.py` 合并进主文件
+5. 用 `manage_subagent_registry.py` 更新本轮 owner 状态
+6. 打印一个最小 summary 供你直接结束返回
+
+不要把窄任务拆成“先探测，再长时间思考如何写报告”。
+
+如果某次 tool result 已经满足停止条件：
+
+- 不要再扩成新的广泛侦察
+- 不要继续回读整份主报告找“更多灵感”
+- 立即完成 merge / registry 更新
+- 然后直接输出固定 completion 文本并结束当前轮
+
 如果 main 之后还需要补充事实，应优先由它用 `SendMessage` 继续你这个 owner。
 但只有在 main 明确指出缺失事实、目标 endpoint / 范围和停止条件时，你才应继续下一轮 observation。
 如果续跑要求只是泛化“再看看还有什么”，或没有指定具体缺口，不要自行扩成目录爆破、静态目录枚举、整站 JS/CSS sweep；直接返回 `needs_main_dispatch`。
@@ -135,6 +164,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 被 main 派单或 `SendMessage` 续跑后，先用最小信息更新 owner 台账：
   - `python3 /home/kali/.claude/tools/manage_subagent_registry.py --registry /home/kali/workspace/reports/subagent_registry.json --role observation-subagent --vector-slug observation --stage <stage> --status running --next-action "<本轮短目标>"`
   - 如果 main 提供了 `owner_id`，追加 `--owner-id <owner_id>`；没有就不要编造
+- main 提供给你的 `owner_id` 指的是 Claude subagent 的 `agentId`；不要把 `python_exec` / `shell_exec` 的 runtime `agent_id` 或 `runtime_key` 当成 `owner_id` 回填
 - 更新前先读取现有主文件
 - 如果主文件 schema 漂移，先执行：
   - `python3 /home/kali/.claude/tools/manage_observation_report.py --report /home/kali/workspace/reports/observation_report.json --repair-in-place`
@@ -145,6 +175,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - JSON 必须 `indent=2`
 - 临时脚本、响应样本、摘要统一写入 `.artifacts/observation/`
 - 完成本轮 checkpoint 后，再更新一次 owner 台账：`--status waiting` 或 `--status completed`，并在 `--next-action` 写清是否还需要后续 observation
+- 对窄任务，优先在**同一次 `python_exec`**里完成“写 update -> merge 主文件 -> 更新 owner 台账”；不要先探测完再把收尾动作拆成多个独立长链条
 
 ## 返回格式
 

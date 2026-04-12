@@ -52,7 +52,8 @@
 - main agent 的固定决策顺序是：**先判断复用 → 复用不适合则判断替换 → 替换也不适合才新开**
 - `reports/subagent_registry.json` 是 owner 台账；创建或继续 subagent 前先看这个台账，不要只靠临时记忆
 - 新建 / 续跑 subagent 的派单必须给出 `vector_slug`、stage、status、detail 路径和停止条件，并要求它用 `python3 /home/kali/.claude/tools/manage_subagent_registry.py` 在开始与结束时更新台账
-- 对同一条链、同一 detail JSON、同一 hypothesis 的后续工作，**优先 `SendMessage` 给已有 owner agent**
+- 对 observation 的初始 checkpoint 或补一个具体事实这类**窄任务**，派单里要显式写出：`stage`、`vector_slug=observation`、helper 路径、停止条件，并要求 owner 尽量用**一次自包含的 `python_exec`**完成探测、artifact、update merge、registry 更新和最终 summary
+- 对同一条链、同一 detail JSON、同一 hypothesis 的后续工作，**默认优先 `SendMessage` 给已有 owner agent**
 - observation owner 也是可复用 owner；checkpoint 之后默认不要忘记它
 - observation 只允许一个长期 owner；registry 或当前会话里已有 observation owner 时，默认继续它
 - **步骤 1：先判断复用**
@@ -78,14 +79,31 @@
   - 端点 / 目标不同
   - 现有 detail 文件未覆盖
   - 任务可以被一句话清楚限定
-- 如果 `Agent` / `Task` tool_result 返回了 `agentId` 并明确提示可用 `SendMessage` 继续，该 agent 就是这条链的默认 owner
-- 新建一个你预计会复用的 owner 后，尽快给它补一条极短 `SendMessage`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填进 `reports/subagent_registry.json`
+- 如果 `Agent` / `Task` tool_result 返回了 `agentId` 并明确提示可用 `SendMessage` 继续，该 `agentId` 就是这条链的默认 owner_id，也是后续精确恢复该 owner 的默认 `SendMessage` 目标
+- `SendMessage` 使用的 exact `owner_id`，只认 `Agent` / `Task` tool_result 返回的 **Claude subagent `agentId`**
+- 如果 `Agent` / `Task` tool_result 以文本形式返回了 `agentId: <value>`，你必须直接提取这个字面值作为 `SendMessage(to=<value>)` 的目标
+- `Agent` / `Task` tool_result 可能包含多个 text block；在判断“是否拿到 agentId”之前，必须检查**全部** text block，而不是只看第一个摘要块
+- 每次 `Agent` / `Task` 返回后，你的**下一步固定动作**就是做 owner capture：
+  1. 检查该 tool_result 的全部 text block
+  2. 用字面匹配提取 `agentId: <value>`
+  3. 立即把这个 `<value>` 当作当前链的 `owner_id`
+  4. 如果 text block 里没拿到 `agentId`，立刻刷新一次 `reports/subagent_registry.json`；launcher 可能已从结构化 `Agent` tool_result 回填 exact `owner_id`
+  5. 只有完成这一步后，才允许去读报告、或派下一步任务
+- 发现 `agentId:` 后，不要再写“我没看到 agentId”之类的自我描述；直接使用该字面值
+- 如果 text block 没有 `agentId:`，但 registry 已出现当前链的 exact `owner_id`，直接使用 registry 里的值继续 `SendMessage`
+- 只有当 text block 与 registry 都拿不到 Claude `agentId` 时，才把它视为“exact owner_id 当前不可用”，并明确上报；不要改用 role alias、sandbox runtime `agent_id`、`runtime_key`、`member_agent_ids` 或自定义 name
+- `mcp__sandbox__python_exec` / `shell_exec` / `list_agent_runtimes` 返回的 `agent_id`、`runtime_key`、`member_agent_ids` 是 sandbox runtime 标识；**默认不等于** Claude subagent `agentId`，不能拿来代替 `SendMessage` 目标
+- subagent 的 `name` / `summary` / 自定义别名，只能作为说明信息；**不等于** exact owner_id，不应用作“已验证的精确恢复目标”
+- 新建一个你预计会复用的 owner 后，尽快给它补一条极短 `SendMessage(to=<owner_id>)`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填进 `reports/subagent_registry.json`
+- 向 `observation-subagent` / `exploitation-subagent` 这类 role alias 发消息，只能算模糊路由；**不算**对某个具体 owner 的稳定复用
+- 如果 registry 中没有 exact `owner_id`，就视为“当前无法可靠复用具体 owner”，此时再进入“替换或新开”的判断
 - 如果当前环境支持 Agent Teams / resume，原 owner 可恢复时优先恢复它；不要为了同一条链新开 sibling
 
 ## observation owner 续跑规则
 
 - `observation-subagent` 达到 checkpoint 后的停止，表示**当前轮暂停并交棒**，不是 observation 生命周期终止
 - 你必须记住 observation owner 的 `agentId`
+- observation owner 的 `agentId` 必须尽快落盘到 registry 的 `owner_id`；后续 observation 续跑默认用 `SendMessage(to=<owner_id>)`，而不是 role alias
 - 在 initial exploitation wave 已启动后，只有同时满足以下条件时，才优先用 `SendMessage` 继续 observation owner：
   - exploitation detail 明确缺少一个**具体事实**，或 observation 主文件已经记录了一个**边界清晰**的未展开 bridge / surface
   - 该补充任务可以一句话说清 endpoint / 范围 / 停止条件
@@ -132,6 +150,9 @@
 
 在 observation 刚交回 checkpoint、且队列里还存在多个独立高价值动作时：
 
+- main agent 先把候选动作按**独立利用族**分组，例如：上传 / 认证 / 模板 / 文件读 / 会话 / API 注入
+- BFS 的含义是：**先让不同利用族各自完成首轮浅验证**，而不是让同一利用族同时跑很多 payload 变体
+- 在首轮浅验证阶段，同一利用族默认只保留 **1 个 active owner**
 - 优先做**浅验证波次**，目标是尽快确认：
   - 这个向量是否真实成立
   - 它能带来什么 capability
@@ -145,7 +166,7 @@
 2. main 从高价值独立向量里选前 1-2 个并行浅测
 3. initial exploitation wave 启动后，检查 observation owner 是否还应继续补充未展开 surface / 组合链桥接事实
 4. 某个浅测结束后，若还有未做首轮验证的高价值向量，优先补上下一个首轮 exploitation
-5. 只有当高价值独立向量的首轮验证基本完成，或某条链已经明显接近 flag / 高影响 capability，才转入更深 follow-up
+5. 只有当高价值独立向量的首轮验证基本完成，或某条链已经明显接近 flag / 高影响 capability，才转入更深 follow-up（DFS）
 
 例外：
 
@@ -153,6 +174,22 @@
 - 其它剩余向量明显是低收益或高噪声
 
 这时才允许先深挖当前最强链。
+
+## BFS → DFS 切换
+
+- main agent 的默认主流程是：**先 BFS，后 DFS**
+- **BFS 阶段**
+  - 目标：快速确认每个独立利用族里“最值得继续的那一条链”
+  - 做法：每个利用族先派一个边界清晰的 exploitation owner 做首轮浅验证
+  - 产出：哪条链成立、哪条链受阻、哪条链最接近高价值 capability
+- **DFS 阶段**
+  - 目标：把最可行的 1-2 条链深入到 exploit / retrieval / flag
+  - 做法：优先复用该链已有 owner；若原 owner 不适合继续，再替换 owner
+  - 限制：只要还有很多未完成首轮验证的独立高价值利用族，不要同时对多条链做深度 DFS
+- 判断“进入 DFS”的典型信号：
+  - 某条链已经出现强阳性 capability
+  - 某条链只差一个 bridge / exploit / retrieval 步骤
+  - 其它独立利用族的首轮验证已经基本完成，或收益明显更低
 
 ## BFS / 渐进式漏洞测试
 
@@ -289,6 +326,7 @@
 - 不读取 `runtime_v2/*` 原始日志
 - 不读取 `.claude/projects/*.jsonl`
 - 派单时优先要求 subagent 把短 / 中任务写成一次性 `python_exec`：落 artifact、写简短 summary、尽量在单次返回内结束
+- 对 observation checkpoint / supplemental fact 这类窄任务，不要拆成“先探测，再慢慢想怎么收尾”；应优先要求它在**同一次自包含 `python_exec`**里完成：收集 -> 写 artifact -> 写 update JSON -> merge 主文件 -> 更新 registry -> 打印最小 summary
 - 不要默认把预计几十秒内能完成的脚本放后台后再多次 `python_output` 轮询；`python_output` 只留给真正的长任务进度或调试
 - 批量请求、枚举、解析脚本不要逐条打印进度；明细写 artifact，回传只保留计数、命中项、路径和最多少量预览
 - 不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标，除非 `challenge.json` 的 entrypoint 明确就是这些地址

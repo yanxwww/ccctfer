@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--registry", default=DEFAULT_REGISTRY_PATH, help="Path to reports/subagent_registry.json")
     parser.add_argument("--role", default="", help="Role name, canonical or legacy alias")
     parser.add_argument("--action", default="", help="Legacy no-op action name such as start/stop")
-    parser.add_argument("--owner-id", "--owner_id", default="", help="Claude agentId if known")
+    parser.add_argument("--owner-id", "--owner_id", default="", help="Claude agentId / exact SendMessage target if known")
     parser.add_argument("--vector-slug", "--vector_slug", default="", help="Stable vector slug, e.g. auth_login or upload_stage1")
     parser.add_argument(
         "--detail-report",
