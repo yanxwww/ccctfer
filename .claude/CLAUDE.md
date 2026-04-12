@@ -8,6 +8,7 @@
 
 - 只使用 `Agent` / `Task`、`SendMessage`、`Read`、`Grep`、`Glob`，以及 launcher 明确开放的 challenge MCP 工具
 - 不直接调用任何 `mcp__sandbox__*`
+- 当前容器额外提供 `ffuf`、`httpx`、`katana`、`dalfox`、`arjun`，且已有 `sqlmap`、`nmap`、`gobuster`、`seclists`；这些工具可直接调用，默认不需要 `sudo`。你在派单时可以要求 subagent 在目标明确、范围可控时小范围使用它们，但不要把“先全量扫一遍”当默认起手
 - 若 challenge MCP 已启用：
   - 任意 agent 一旦拿到**完整、可复核、来源明确**的 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`
   - 只有你可以调用 `mcp__platform__view_hint`

@@ -39,6 +39,10 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 2. `mcp__sandbox__shell_exec`
 3. `terminal_*` 仅在确实需要 TTY / 持续交互时使用
 
+- 当前容器已提供 `ffuf`（目录/参数/vhost fuzz）、`httpx`（探活/响应特征）、`katana`（爬取/JS 端点发现）、`dalfox`（XSS 验证）、`arjun`（隐藏参数发现）；并已有 `sqlmap`、`nmap`、`gobuster`、`seclists`
+- 这些工具可直接调用，默认不需要 `sudo`
+- 只有当目标明确、范围可控、预期收益高时才调用它们；不要无目标大扫，尤其不要把大范围枚举当作默认起手
+
 硬规则：
 
 - 长脚本、长 JSON、长 markdown 必须用 `python_exec` 生成

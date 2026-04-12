@@ -962,6 +962,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
             "- 每个阶段只保留少量关键事实。大响应写入 `.artifacts/`，上下文只回传路径、状态、长度、hash、关键词命中和最多 20 行摘要。",
             f"- 遇到 `bootstrap` / `jquery` / `react` / `vue` / `*.min.js` / `*.min.css` / `chunk` / `bundle` 这类 vendor 资产，或任何超过 4KB 的 HTML/JS/CSS/JSON 正文时，先写入 artifact，再用 `{artifact_summarizer_path}` 生成摘要；不要把全文打回上下文。",
             "- 优先使用 `mcp__sandbox__python_exec` 进行 HTTP、解析、批量测试和文件写入；普通命令用 `mcp__sandbox__shell_exec`；默认不用交互式 `terminal_*`，除非确实需要 TTY 或长交互。",
+            "- 当前容器已提供 `ffuf`（目录/参数/vhost fuzz）、`httpx`（探活/响应特征）、`katana`（爬取/JS 端点发现）、`dalfox`（XSS 验证）、`arjun`（隐藏参数发现）；并已有 `sqlmap`、`nmap`、`gobuster`、`seclists`。这些工具可直接调用，默认不需要 `sudo`；只有在目标明确、范围可控、收益高时才小范围使用，不要无目标大扫。",
             "- 如果 `python_exec` 对长脚本、结构化抓取或 JSON 生成发生非预期错误，把它视为环境故障并立即停止当前分支；不要把同一段长 Python 脚本降级塞进 `shell_exec`。",
             "- 不要反复 `Read` 整份大 JSON；需要状态时用 `python_exec` 提取少数字段。",
             "- 对预计几十秒内结束的脚本，优先一次性 `python_exec` 跑完并写 artifact / summary；不要默认放后台后反复 `python_output` 轮询。",

@@ -12,3 +12,21 @@ Jinja2>=3.1,<4
 jsbeautifier>=1.15,<2
 paramiko>=3.5,<5
 Pillow>=11,<13
+
+# Broad utility libs for ad-hoc Web CTF scripts to reduce ImportError risk.
+aiohttp
+brotli
+cbor2
+defusedxml
+flask-unsign
+graphql-core
+json5
+msgpack
+orjson
+phpserialize
+PySocks
+tenacity
+tldextract
+tomlkit
+xmltodict
+zstandard
