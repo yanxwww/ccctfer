@@ -48,11 +48,31 @@
 ## 复用优先
 
 - 用 `Agent` / `Task` 创建新的 subagent；用 `SendMessage` 继续已有 subagent
+- 原则是：**可以新开，但必须优先复用已有 owner**
+- main agent 的固定决策顺序是：**先判断复用 → 复用不适合则判断替换 → 替换也不适合才新开**
 - `reports/subagent_registry.json` 是 owner 台账；创建或继续 subagent 前先看这个台账，不要只靠临时记忆
 - 新建 / 续跑 subagent 的派单必须给出 `vector_slug`、stage、status、detail 路径和停止条件，并要求它用 `python3 /home/kali/.claude/tools/manage_subagent_registry.py` 在开始与结束时更新台账
 - 对同一条链、同一 detail JSON、同一 hypothesis 的后续工作，**优先 `SendMessage` 给已有 owner agent**
 - observation owner 也是可复用 owner；checkpoint 之后默认不要忘记它
 - observation 只允许一个长期 owner；registry 或当前会话里已有 observation owner 时，默认继续它
+- **步骤 1：先判断复用**
+  - 同一 detail JSON / 同一 hypothesis / 同一 vector_slug 是否已有 owner
+  - 当前任务是不是原链路的下一步、补证、deepen、bridge check、或 exploit / retrieval
+  - 只要旧 owner 还能恢复、上下文未明显失真、任务边界仍一致，就优先 `SendMessage`
+- **步骤 2：复用不适合则判断替换**
+  - 只有在以下情况才判定“旧 owner 不适合继续”：
+    - 上下文明显污染，已被错误假设或无关产物拖偏
+    - 上下文过厚，继续 `SendMessage` 的成本明显高于重开
+    - runtime / 会话状态异常，恢复失败或工具状态不可信
+    - 旧 owner 连续遗漏 main 明确要求的关键点
+    - 任务形态已经改变，不再是同一个工作单元
+  - 若属于同一条链，但旧 owner 已不适合继续，可以新开**替代 owner**
+- **步骤 3：替换也不适合才新开**
+  - 只有当任务本身就是独立新链路，而不是旧链路的继续或替代，才新开全新的 `Agent`
+- 任意时刻最多只允许 **1 个 observation owner**；如果它还可恢复，就禁止新开 observation sibling
+- 任意时刻同时活跃的 exploitation owner 不得超过并发上限；如果 registry 中已达到上限，禁止继续新开 `Agent`，只能先审阅结果、等待返回或 `SendMessage` 续跑已有 owner
+- 在**尚未读取任何一个新增 exploitation detail 报告**之前，不要连续新开超过 **2 个** exploitation owner；先看结果，再决定下一批
+- 对同一 endpoint / 同一 hypothesis / 同一 detail 链，默认只允许 **1 个 active owner**；只有原 owner 已明确证明存在正向 capability 且需要拆成下一跳时，才允许分裂出新的 sibling
 - 只有在以下情况才新开 `Agent`：
   - 向量彼此独立
   - 端点 / 目标不同
