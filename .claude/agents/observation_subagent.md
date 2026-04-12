@@ -42,6 +42,9 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 硬规则：
 
 - 长脚本、长 JSON、长 markdown 必须用 `python_exec` 生成
+- 对预计几十秒内结束的脚本，显式给足 `wait_timeout_seconds`，优先在一次 `python_exec` 内完成；不要默认放后台再反复 `python_output`
+- `python_output` 只用于真正的长任务进度或调试；短 / 中任务优先落 artifact 并回传最终 summary，必要时用一次 `python_get`
+- 批量探测脚本不要逐条 `print` 进度；把明细写进 `.artifacts/observation/`，回传只保留计数、命中项、路径和少量摘要
 - `python_exec` 对长脚本/结构化抓取若发生非预期错误，把它视为环境故障并立即上报；不要把同一段长 Python 降级塞进 `shell_exec`
 - 不要读取 `runtime_v2/*`、`.claude/projects/*.jsonl`、helper 源码
 - 不要把超过 4KB 的正文回灌上下文；只落盘 artifact，并回传摘要
@@ -124,6 +127,8 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 不要继续在同一轮里做“顺手的额外侦察”
 
 如果 main 之后还需要补充事实，应优先由它用 `SendMessage` 继续你这个 owner。
+但只有在 main 明确指出缺失事实、目标 endpoint / 范围和停止条件时，你才应继续下一轮 observation。
+如果续跑要求只是泛化“再看看还有什么”，或没有指定具体缺口，不要自行扩成目录爆破、静态目录枚举、整站 JS/CSS sweep；直接返回 `needs_main_dispatch`。
 
 ## 写入规则
 

@@ -86,12 +86,19 @@
 
 - `observation-subagent` 达到 checkpoint 后的停止，表示**当前轮暂停并交棒**，不是 observation 生命周期终止
 - 你必须记住 observation owner 的 `agentId`
-- 在 initial exploitation wave 已启动后，如果还存在以下任一情况，优先用 `SendMessage` 继续 observation owner：
-  - 还有未展开的独立 attack surface / atomic hypothesis
-  - exploitation 返回了一个明确缺失事实
-  - 已出现组合链线索，但桥接条件仍不完整
-  - 当前 exploitation 队列未满，且 observation 还能低成本补更多高价值事实
-- 只有在 observation owner 明确不可恢复、任务已经接近成功、或报告已显示没有更多高价值 surface 时，才允许不续跑它
+- 在 initial exploitation wave 已启动后，只有同时满足以下条件时，才优先用 `SendMessage` 继续 observation owner：
+  - exploitation detail 明确缺少一个**具体事实**，或 observation 主文件已经记录了一个**边界清晰**的未展开 bridge / surface
+  - 该补充任务可以一句话说清 endpoint / 范围 / 停止条件
+  - 该补充任务直接服务于一个当前开放中的链路，而不是泛化“再看看还有什么”
+- 典型允许续跑的情况：
+  - exploitation detail 写明 `needs_more_observation=true`，且点名缺哪个参数、页面、文件路径或认证前置事实
+  - 已出现组合链线索，但还缺一个明确桥接条件
+  - observation 主文件里已经写出一个尚未展开、且与当前链直接相关的 attack surface
+- 以下情况**不构成**续跑理由：
+  - “队列还没满，可以顺手继续看看”
+  - “也许还有更多高价值 surface”
+  - 泛化目录爆破、静态目录枚举、整站 JS/CSS sweep、无明确目标的补背景侦察
+- 只有在 observation owner 明确不可恢复、任务已经接近成功、或报告已显示没有更多与开放链直接相关的高价值事实时，才允许不续跑它
 
 ## 派 exploitation 前必须确认
 
@@ -238,7 +245,7 @@
 - `recommended_next_step` 已经能给出一条短而明确的 exploitation 动作
 
 不要因为“可能还能多收集一些背景信息”而拖延 exploitation 启动。
-但这次结束只表示 checkpoint 已交回；只要还有高价值未展开 surface，后续仍应考虑继续同一 observation owner。
+但这次结束只表示 checkpoint 已交回；后续只有在存在明确缺失事实或边界清晰的桥接任务时，才应考虑继续同一 observation owner。
 
 ## 审核 subagent 结果
 
@@ -281,6 +288,9 @@
 - 不主动扫描整个工作区
 - 不读取 `runtime_v2/*` 原始日志
 - 不读取 `.claude/projects/*.jsonl`
+- 派单时优先要求 subagent 把短 / 中任务写成一次性 `python_exec`：落 artifact、写简短 summary、尽量在单次返回内结束
+- 不要默认把预计几十秒内能完成的脚本放后台后再多次 `python_output` 轮询；`python_output` 只留给真正的长任务进度或调试
+- 批量请求、枚举、解析脚本不要逐条打印进度；明细写 artifact，回传只保留计数、命中项、路径和最多少量预览
 - 不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标，除非 `challenge.json` 的 entrypoint 明确就是这些地址
 - 容器内 `localhost:8000` 是 sandbox MCP 服务，不是 CTF 目标；目标不可达时写 blocker / `needs_more_observation`，不要转去扫描本地端口或 MCP 服务
 - observation / exploitation 报告变大后，不要反复整份 `Read`

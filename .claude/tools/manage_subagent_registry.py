@@ -2,17 +2,64 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+DEFAULT_REGISTRY_PATH = "reports/subagent_registry.json"
+ROLE_ALIASES = {
+    "observation": "observation-subagent",
+    "observation-subagent": "observation-subagent",
+    "exploitation": "exploitation-subagent",
+    "exploitation-subagent": "exploitation-subagent",
+}
+STATUS_ALIASES = {
+    "in_progress": "running",
+    "running": "running",
+    "resume": "running",
+    "paused": "waiting",
+    "pending": "waiting",
+    "waiting": "waiting",
+    "done": "completed",
+    "complete": "completed",
+    "completed": "completed",
+    "success": "completed",
+    "failed": "failed",
+    "blocked": "blocked",
+    "needs_more_observation": "needs_more_observation",
+}
+
+
+def collapse_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def normalize_role(value: Any) -> str:
+    role = collapse_text(value).lower()
+    return ROLE_ALIASES.get(role, role)
+
+
+def normalize_status(value: Any, action: Any = "") -> str:
+    status = collapse_text(value).lower().replace("-", "_")
+    if status:
+        return STATUS_ALIASES.get(status, status)
+    action_text = collapse_text(action).lower()
+    if action_text in {"start", "resume"}:
+        return "running"
+    if action_text in {"stop", "finish", "complete"}:
+        return "completed"
+    return ""
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Maintain the lightweight subagent owner registry.")
-    parser.add_argument("--registry", required=True, help="Path to reports/subagent_registry.json")
-    parser.add_argument("--role", choices=("observation-subagent", "exploitation-subagent"))
+    parser.add_argument("--registry", default=DEFAULT_REGISTRY_PATH, help="Path to reports/subagent_registry.json")
+    parser.add_argument("--role", default="", help="Role name, canonical or legacy alias")
+    parser.add_argument("--action", default="", help="Legacy no-op action name such as start/stop")
     parser.add_argument("--owner-id", "--owner_id", default="", help="Claude agentId if known")
     parser.add_argument("--vector-slug", "--vector_slug", default="", help="Stable vector slug, e.g. auth_login or upload_stage1")
     parser.add_argument(
@@ -29,15 +76,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repair-in-place", "--repair_in_place", action="store_true", help="Coerce registry into canonical shape")
     parser.add_argument("--print-summary", "--print_summary", action="store_true", help="Print a compact JSON summary")
     args = parser.parse_args()
+    args.role = normalize_role(args.role)
+    args.status = normalize_status(args.status, args.action)
     if not args.repair_in_place and not args.role:
         parser.error("Either --role or --repair-in-place is required.")
+    if args.role not in {"observation-subagent", "exploitation-subagent", ""}:
+        parser.error("argument --role: expected observation-subagent or exploitation-subagent")
     if args.role == "exploitation-subagent" and not collapse_text(args.vector_slug) and not collapse_text(args.detail_report):
         parser.error("exploitation-subagent requires --vector-slug or --detail-report.")
     return args
-
-
-def collapse_text(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def normalize_slug(value: Any) -> str:
@@ -66,15 +113,73 @@ def empty_registry() -> dict[str, Any]:
     }
 
 
+def merge_registries(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    merged = empty_registry()
+    existing_observation = existing.get("observation_owner")
+    incoming_observation = incoming.get("observation_owner")
+    if isinstance(existing_observation, dict) and has_meaningful_entry(existing_observation):
+        merged["observation_owner"] = compact_entry(existing_observation)
+    if isinstance(incoming_observation, dict) and has_meaningful_entry(incoming_observation):
+        merged["observation_owner"] = compact_entry(incoming_observation)
+
+    seen: set[tuple[str, str, str]] = set()
+    for collection in (existing.get("exploitation_owners"), incoming.get("exploitation_owners")):
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            entry = compact_entry(item)
+            key = entry_key(entry)
+            if key in seen or not has_meaningful_entry(entry):
+                continue
+            seen.add(key)
+            merged["exploitation_owners"].append(entry)
+    return merged
+
+
 def load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        index = 0
+        merged = empty_registry()
+        recovered = False
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text):
+                break
+            try:
+                chunk, index = decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                break
+            if isinstance(chunk, dict):
+                merged = merge_registries(merged, coerce_registry(chunk))
+                recovered = True
+        return merged if recovered else {}
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def registry_lock_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.lock")
+
+
+def lock_registry(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = registry_lock_path(path).open("a+", encoding="utf-8")
+    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    return lock_handle
 
 
 def compact_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -103,13 +208,14 @@ def coerce_registry(payload: dict[str, Any]) -> dict[str, Any]:
     observation_owner = payload.get("observation_owner")
     if isinstance(observation_owner, dict) and has_meaningful_entry(observation_owner):
         registry["observation_owner"] = compact_entry(
-            {
-                **observation_owner,
-                "role": "observation-subagent",
-                "vector_slug": normalize_slug(observation_owner.get("vector_slug") or "observation"),
-                "detail_report": normalize_workspace_path(observation_owner.get("detail_report")),
-            }
-        )
+                {
+                    **observation_owner,
+                    "role": "observation-subagent",
+                    "vector_slug": normalize_slug(observation_owner.get("vector_slug") or "observation"),
+                    "detail_report": normalize_workspace_path(observation_owner.get("detail_report")),
+                    "status": normalize_status(observation_owner.get("status")),
+                }
+            )
 
     owners = payload.get("exploitation_owners")
     if isinstance(owners, list):
@@ -123,6 +229,7 @@ def coerce_registry(payload: dict[str, Any]) -> dict[str, Any]:
                     "role": "exploitation-subagent",
                     "vector_slug": normalize_slug(item.get("vector_slug") or Path(collapse_text(item.get("detail_report"))).stem),
                     "detail_report": normalize_workspace_path(item.get("detail_report")),
+                    "status": normalize_status(item.get("status")),
                 }
             )
             key = (
@@ -148,7 +255,7 @@ def upsert_observation(registry: dict[str, Any], args: argparse.Namespace) -> No
                 "role": "observation-subagent",
                 "vector_slug": normalize_slug(args.vector_slug or "observation"),
                 "stage": collapse_text(args.stage),
-                "status": collapse_text(args.status),
+                "status": normalize_status(args.status, args.action),
                 "next_action": collapse_text(args.next_action),
                 "updated_at": now_iso(),
             }
@@ -181,7 +288,7 @@ def upsert_exploitation(registry: dict[str, Any], args: argparse.Namespace) -> N
             "vector_slug": vector_slug,
             "detail_report": detail_report,
             "stage": collapse_text(args.stage),
-            "status": collapse_text(args.status),
+            "status": normalize_status(args.status, args.action),
             "next_action": collapse_text(args.next_action),
             "updated_at": now_iso(),
         }
@@ -228,13 +335,18 @@ def summary(registry: dict[str, Any]) -> dict[str, Any]:
 def main() -> None:
     args = parse_args()
     registry_path = Path(args.registry)
-    registry = coerce_registry(load_json(registry_path))
-    if not args.repair_in_place:
-        if args.role == "observation-subagent":
-            upsert_observation(registry, args)
-        elif args.role == "exploitation-subagent":
-            upsert_exploitation(registry, args)
-    write_json(registry_path, registry)
+    lock_handle = lock_registry(registry_path)
+    try:
+        registry = coerce_registry(load_json(registry_path))
+        if not args.repair_in_place:
+            if args.role == "observation-subagent":
+                upsert_observation(registry, args)
+            elif args.role == "exploitation-subagent":
+                upsert_exploitation(registry, args)
+        write_json(registry_path, registry)
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
     if args.print_summary:
         print(json.dumps(summary(registry), ensure_ascii=False, indent=2))
 
