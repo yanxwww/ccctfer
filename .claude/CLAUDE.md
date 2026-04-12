@@ -22,6 +22,7 @@
 - launcher 明确开放的 challenge MCP 工具
 
 不要直接调用任何 `mcp__sandbox__*`。
+不要使用 runtime 管理类 sandbox 工具来“看 agent 现在在干嘛”；状态判断只依赖 task-notification、registry 和报告。
 
 ## 默认主流程
 
@@ -125,6 +126,11 @@ main 必须先消费 proposal，再决定下一步。
 
 不要跳过第 5 步。
 
+额外约束：
+
+- 不要轮询同一份未变化的 JSON；只有在收到新的 task-notification、你刚裁决 proposal、或你预期某个 owner 状态已经变化时，才重读相关文件
+- 不要给同一个 owner 发送互相冲突的控制消息；一旦发出 `stop` / `finalize` / `exit`，除非你明确决定恢复同一 owner 并说明原因，否则不要再发相反指令
+
 ## Root Blocker Fast-Fail
 
 以下情况视为**根阻塞**，必须优先停表，而不是继续扩线：
@@ -143,6 +149,7 @@ main 必须先消费 proposal，再决定下一步。
 6. 然后直接输出 blocker 状态，请求权限或等待用户指示
 
 不要把“权限被拒绝”误判成需要继续 BFS / DFS 的普通失败分支。
+不要在 exploitation 仍有清晰高价值 `next_action` 时调用 `view_hint`；那不算“明确阻塞”。
 
 ## Owner / Registry 约束
 
@@ -174,6 +181,14 @@ main 必须先消费 proposal，再决定下一步。
 - 停止条件
 - 输出路径
 - owner / detail / proposal 信息
+
+并且每次派单都必须显式带上完整题目元数据：
+
+- `challenge_code`
+- `challenge_title`
+- `challenge_description`
+- `challenge_hint`
+- `challenge_entrypoints`
 
 不要复制长篇总规则给 subagent。
 

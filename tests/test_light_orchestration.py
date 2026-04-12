@@ -104,6 +104,55 @@ class LightOrchestrationTests(unittest.TestCase):
             resolved = json.loads(registry.read_text(encoding="utf-8"))
             self.assertEqual(resolved["proposal_queue"][0]["status"], "resolved")
 
+    def test_registry_preserves_exact_owner_id_when_generic_role_is_sent_later(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "reports" / "subagent_registry.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "observation_owner": {},
+                        "exploitation_owners": [
+                            {
+                                "owner_id": "a711ce8d53e97c6bf",
+                                "role": "exploitation-subagent",
+                                "vector_slug": "sql_injection_job_type",
+                                "detail_report": "reports/exploitation/exploitation_sql_injection_job_type.json",
+                                "status": "running",
+                            }
+                        ],
+                        "proposal_queue": [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.run_cmd(
+                str(REGISTRY_HELPER),
+                "owner",
+                "upsert",
+                "--registry",
+                str(registry),
+                "--role",
+                "exploitation-subagent",
+                "--owner-id",
+                "exploitation-subagent",
+                "--vector-slug",
+                "sql_injection_job_type",
+                "--detail-report",
+                "reports/exploitation/exploitation_sql_injection_job_type.json",
+                "--stage",
+                "exploit_or_retrieval",
+                "--status",
+                "running",
+            )
+            updated = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(updated["exploitation_owners"][0]["owner_id"], "a711ce8d53e97c6bf")
+
     def test_observation_report_repairs_to_v2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "reports" / "observation_report.json"
@@ -163,7 +212,7 @@ class LightOrchestrationTests(unittest.TestCase):
             detail.write_text(
                 json.dumps(
                     {
-                        "schema_version": 2,
+                        "schema_version": "1.0",
                         "vector_slug": "auth",
                         "stage": "existence_check",
                         "status": "blocked",
@@ -180,7 +229,9 @@ class LightOrchestrationTests(unittest.TestCase):
 
             self.run_cmd(str(EXPLOITATION_HELPER), "--index", str(index_path), "--detail", str(detail))
             index = json.loads(index_path.read_text(encoding="utf-8"))
+            normalized_detail = json.loads(detail.read_text(encoding="utf-8"))
             self.assertEqual(index["schema_version"], 2)
+            self.assertEqual(normalized_detail["schema_version"], 2)
             self.assertEqual(index["summary"]["open_proposals"][0]["kind"], "fact_challenge")
             self.assertEqual(index["summary"]["priority_actions"][0]["kind"], "proposal")
 
@@ -190,6 +241,8 @@ class LightOrchestrationTests(unittest.TestCase):
         command = run_task.build_claude_shell_command(challenge_mcp_enabled=False, agent_mode="orchestrated")
         self.assertIn('--tools "Agent,Task,SendMessage,Read,Grep,Glob"', command)
         self.assertIn('--allowedTools "Agent Task SendMessage Read Grep Glob mcp__sandbox__python_exec', command)
+        self.assertNotIn("mcp__sandbox__list_agent_runtimes", command)
+        self.assertNotIn("mcp__sandbox__cleanup_agent_runtime", command)
 
     def test_orchestrated_prompt_includes_root_blocker_fast_fail_rules(self) -> None:
         import run_task
@@ -214,6 +267,9 @@ class LightOrchestrationTests(unittest.TestCase):
         self.assertIn("不要在拿到 `Agent` 工具返回的真实 `agentId` 前，用猜测的 owner_id 预写 registry", prompt)
         self.assertIn("真实 checkpoint", prompt)
         self.assertIn("不是权限型 root blocker", prompt)
+        self.assertIn("每次 `Agent` / `SendMessage` 派单都必须显式携带完整题目元数据", prompt)
+        self.assertIn("不要轮询同一份未变化的 JSON", prompt)
+        self.assertIn("不要给同一个 owner 发送互相冲突的控制消息", prompt)
 
 
 if __name__ == "__main__":

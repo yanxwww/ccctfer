@@ -19,6 +19,15 @@ ROLE_ALIASES = {
     "exploitation": "exploitation-subagent",
     "exploitation-subagent": "exploitation-subagent",
 }
+GENERIC_OWNER_IDS = set(ROLE_ALIASES) | set(ROLE_ALIASES.values()) | {"main", "main-agent", "main_agent"}
+OWNER_ID_PLACEHOLDER_MARKERS = (
+    "<owner_id",
+    "owner_id if provided",
+    "owner_id if known",
+    "<target owner",
+    "<assigned owner",
+    "<owner id",
+)
 OWNER_STATUS_ALIASES = {
     "in_progress": "running",
     "running": "running",
@@ -63,6 +72,18 @@ def collapse_text(value: Any) -> str:
 def normalize_role(value: Any) -> str:
     role = collapse_text(value).lower()
     return ROLE_ALIASES.get(role, role)
+
+
+def normalize_owner_identifier(value: Any) -> str:
+    text = collapse_text(value)
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered in GENERIC_OWNER_IDS:
+        return ""
+    if any(marker in lowered for marker in OWNER_ID_PLACEHOLDER_MARKERS):
+        return ""
+    return text
 
 
 def normalize_owner_status(value: Any, action: Any = "") -> str:
@@ -204,7 +225,7 @@ def owner_key(entry: dict[str, Any]) -> tuple[str, str, str]:
     return (
         normalize_slug(entry.get("vector_slug")) if entry.get("vector_slug") else "",
         normalize_workspace_path(entry.get("detail_report")),
-        collapse_text(entry.get("owner_id")),
+        normalize_owner_identifier(entry.get("owner_id")),
     )
 
 
@@ -228,7 +249,7 @@ def coerce_owner(entry: Any, role: str) -> dict[str, Any]:
             "vector_slug": normalize_slug(entry.get("vector_slug") or ("observation" if role == "observation-subagent" else entry.get("vector_slug"))),
             "detail_report": normalize_workspace_path(entry.get("detail_report")),
             "status": normalize_owner_status(entry.get("status"), entry.get("action")),
-            "owner_id": collapse_text(entry.get("owner_id")),
+            "owner_id": normalize_owner_identifier(entry.get("owner_id")),
             "stage": collapse_text(entry.get("stage")),
             "next_action": collapse_text(entry.get("next_action")),
             "updated_at": collapse_text(entry.get("updated_at")),
@@ -246,9 +267,9 @@ def coerce_proposal(entry: Any) -> dict[str, Any]:
             "id": collapse_text(entry.get("id")),
             "kind": collapse_text(entry.get("kind")).lower(),
             "status": normalize_proposal_status(entry.get("status") or "proposed"),
-            "raised_by_owner_id": collapse_text(entry.get("raised_by_owner_id")),
-            "target_owner_id": collapse_text(entry.get("target_owner_id")),
-            "assigned_owner_id": collapse_text(entry.get("assigned_owner_id")),
+            "raised_by_owner_id": normalize_owner_identifier(entry.get("raised_by_owner_id")),
+            "target_owner_id": normalize_owner_identifier(entry.get("target_owner_id")),
+            "assigned_owner_id": normalize_owner_identifier(entry.get("assigned_owner_id")),
             "vector_slug": normalize_slug(entry.get("vector_slug")) if collapse_text(entry.get("vector_slug")) else "",
             "report_ref": normalize_workspace_path(entry.get("report_ref")),
             "exact_inputs": parse_jsonish(entry.get("exact_inputs")),
@@ -405,7 +426,7 @@ def upsert_owner(registry: dict[str, Any], args: argparse.Namespace) -> None:
     role = normalize_role(args.role)
     owner = compact_owner(
         {
-            "owner_id": collapse_text(args.owner_id),
+            "owner_id": normalize_owner_identifier(args.owner_id),
             "role": role,
             "vector_slug": normalize_slug(args.vector_slug or ("observation" if role == "observation-subagent" else args.vector_slug)),
             "detail_report": normalize_workspace_path(args.detail_report),
@@ -452,9 +473,9 @@ def raise_proposal(registry: dict[str, Any], args: argparse.Namespace) -> dict[s
             "id": collapse_text(getattr(args, "proposal_id", "")) or next_proposal_id(registry),
             "kind": collapse_text(args.kind).lower(),
             "status": normalize_proposal_status(getattr(args, "status", "") or "proposed") or "proposed",
-            "raised_by_owner_id": collapse_text(getattr(args, "raised_by_owner_id", "")),
-            "target_owner_id": collapse_text(getattr(args, "target_owner_id", "")),
-            "assigned_owner_id": collapse_text(getattr(args, "assigned_owner_id", "")),
+            "raised_by_owner_id": normalize_owner_identifier(getattr(args, "raised_by_owner_id", "")),
+            "target_owner_id": normalize_owner_identifier(getattr(args, "target_owner_id", "")),
+            "assigned_owner_id": normalize_owner_identifier(getattr(args, "assigned_owner_id", "")),
             "vector_slug": normalize_slug(getattr(args, "vector_slug", "")) if collapse_text(getattr(args, "vector_slug", "")) else "",
             "report_ref": normalize_workspace_path(getattr(args, "report_ref", "")),
             "exact_inputs": parse_jsonish(getattr(args, "exact_inputs", "")),
@@ -507,7 +528,7 @@ def decide_proposal(registry: dict[str, Any], args: argparse.Namespace) -> dict[
         {
             **item,
             "status": status,
-            "assigned_owner_id": collapse_text(getattr(args, "assigned_owner_id", "")) or item.get("assigned_owner_id"),
+            "assigned_owner_id": normalize_owner_identifier(getattr(args, "assigned_owner_id", "")) or item.get("assigned_owner_id"),
             "main_decision": decision or item.get("main_decision"),
             "updated_at": now_iso(),
         }
@@ -528,7 +549,7 @@ def resolve_proposal(registry: dict[str, Any], args: argparse.Namespace) -> dict
         {
             **item,
             "status": "resolved",
-            "assigned_owner_id": collapse_text(getattr(args, "assigned_owner_id", "")) or item.get("assigned_owner_id"),
+            "assigned_owner_id": normalize_owner_identifier(getattr(args, "assigned_owner_id", "")) or item.get("assigned_owner_id"),
             "resolution": parse_jsonish(getattr(args, "resolution", "")) or item.get("resolution"),
             "updated_at": now_iso(),
         }

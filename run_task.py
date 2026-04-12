@@ -1055,14 +1055,19 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- 若 `reports/subagent_registry.json.proposal_queue` 中存在未决 proposal，先处理 proposal，再继续 BFS / DFS。",
         "- proposal 只允许：`fact_challenge`、`parameter_challenge`、`decisive_payload_family`、`bridge_gap`。",
         "- main agent 自己不执行任何 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
+        "- 不要使用 `mcp__sandbox__list_agent_runtimes`、`mcp__sandbox__cleanup_agent_runtime` 这类 runtime 管理工具做调度判断；owner 状态只看 task-notification、registry 和报告。",
         "- 起步只允许 1 个 `observation-subagent`。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
         "- observation 只做收集式测试：baseline + 最多 3 个 classifier probes；出现 anomaly 就 checkpoint，不顺手追 exploit。",
         "- subagent 发现冲突或决定性 family 时，只能写 proposal，不能自己冻结、换路或继续扩线。",
         "- challenge 的默认复验者是原 owner；只有 owner 污染、无法恢复或连续两次被证伪时才替换。",
         "- 给 subagent 的派单必须短，并显式写：角色、stage、目标、预算、停止条件、输出路径。",
+        "- 每次 `Agent` / `SendMessage` 派单都必须显式携带完整题目元数据：`challenge_code`、`challenge_title`、`challenge_description`、`challenge_hint`、`challenge_entrypoints`；即使 subagent 还能自己读 challenge JSON，也不能省略。",
+        "- 不要轮询同一份未变化的 JSON；只有在收到新的 task-notification、你刚裁决 proposal、或你预期某个 owner 状态已经变化时，才重读相关文件。",
+        "- 不要给同一个 owner 发送互相冲突的控制消息；一旦发出 `stop` / `finalize` / `exit`，除非你明确决定恢复同一 owner 并说明原因，否则不要再发相反指令。",
         "- 若首次 `mcp__sandbox__*` 调用被拒绝，或首轮 subagent 明确报告“工具权限被拒绝且无真实 evidence/capability”，视为 root blocker：不要再启动新的 observation / exploitation subagent，不要再重试 sandbox。",
         "- root blocker 下，最多只允许 main 额外调用 1 次 `view_hint`；随后直接停表并向用户报告权限/环境阻塞。",
+        "- 只有在未决 proposal 已清空、现有 owner 没有高价值 `next_action`、且当前链条确实缺少外部信息时，才算“明确阻塞”并允许 `view_hint`；不要在 exploitation 仍有清晰可执行动作时调用 hint。",
         "- 不要让 exploitation-subagent 代替 observation 做基础侦察。",
         "- 不要读取 helper 源码来猜调用方式；只有 helper 本身出现语法/schema 错误时才允许读源码排障。",
         "- 不要在拿到 `Agent` 工具返回的真实 `agentId` 前，用猜测的 owner_id 预写 registry。",
@@ -1300,8 +1305,6 @@ SANDBOX_TOOL_NAMES = (
     "mcp__sandbox__terminal_write",
     "mcp__sandbox__terminal_interrupt",
     "mcp__sandbox__terminal_close",
-    "mcp__sandbox__list_agent_runtimes",
-    "mcp__sandbox__cleanup_agent_runtime",
 )
 
 
