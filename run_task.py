@@ -722,6 +722,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- 起步只允许 1 个 `observation-subagent`。",
         "- observation 一旦达到可利用 checkpoint，就应先结束当前轮并把主文件交回；不要为了“还能多收集一些背景”而继续独占时间片。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
+        "- 创建 subagent 时必须显式设置 `subagent_type` 为 `observation-subagent` 或 `exploitation-subagent`，不要使用泛型/default agent 执行 CTF 任务。",
         "- 给 subagent 的派单第一行必须写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`。",
         "- 不要在 subagent 派单里写“你是 main agent”“按照 main agent 状态机调度”等字样；`~/.claude/CLAUDE.md` 的 main-only 调度规则只由你使用。",
         "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链必须优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",

@@ -34,6 +34,7 @@
 ## 调度默认值
 
 - 只调度两类角色：`observation-subagent`、`exploitation-subagent`
+- 创建 subagent 时必须显式设置 `subagent_type` 为 `observation-subagent` 或 `exploitation-subagent`，不要使用泛型/default agent 执行 CTF 任务
 - 给 subagent 的派单必须短，只写：
   - 第一行固定写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`
   - 目标
