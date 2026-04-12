@@ -27,7 +27,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 
 如果你在允许的 observation 动作中**被动直接**看到了完整 flag：
 
-- 若 `mcp__platform__submit_flag` 可用，必须立即提交
+- 若 `mcp__platform__submit_flag` 可用，必须立即提交，且 `code` 只允许使用 `/home/kali/workspace/.inputs/challenge.json` 里的精确 `challenge_code`
 - 若返回 `correct=true`，立即写：
   - `/home/kali/workspace/.results/flag.txt`
   - `/home/kali/workspace/.results/final_report.md`

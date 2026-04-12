@@ -33,6 +33,8 @@ AGENT_TEAMS_ENV_NAME = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 AGENT_TEAMS_ENV_VALUE = "1"
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
+CLAUDE_SETTINGS_NAME = "settings.json"
+CLAUDE_HOOKS_DIR_NAME = "hooks"
 INPUTS_DIR_NAME = ".inputs"
 REPORTS_DIR_NAME = "reports"
 EXPLOITATION_REPORTS_DIR_NAME = "exploitation"
@@ -50,6 +52,8 @@ EXPLOITATION_ARTIFACTS_RELATIVE_DIR = f"{ARTIFACTS_DIR_NAME}/{EXPLOITATION_REPOR
 RESULT_FLAG_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/flag.txt"
 RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
+HOOK_SUBMIT_SUCCESS_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/hook_submit_success.json"
+HOOK_SUBMIT_PARTIAL_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/hook_submit_partial.json"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 SUBAGENT_REGISTRY_HELPER_RELATIVE_PATH = ".claude/tools/manage_subagent_registry.py"
 EXPLOITATION_INDEX_MERGER_RELATIVE_PATH = ".claude/tools/manage_exploitation_report.py"
@@ -617,6 +621,36 @@ class AgentIdCaptureWatcher:
         self._seen.add(key)
 
 
+class SuccessfulFlagWatcher:
+    def __init__(self, task_dir: Path, container_name: str, *, poll_interval_seconds: float = 0.5) -> None:
+        self.task_dir = task_dir
+        self.container_name = container_name
+        self.poll_interval_seconds = poll_interval_seconds
+        self.sentinel_path = task_dir / HOOK_SUBMIT_SUCCESS_RELATIVE_PATH
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="flag-success-watcher", daemon=True)
+        self._triggered = False
+
+    @property
+    def triggered(self) -> bool:
+        return self._triggered
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=max(1.0, self.poll_interval_seconds * 4))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self.sentinel_path.exists():
+                self._triggered = True
+                interrupt_claude(self.container_name)
+                return
+            self._stop_event.wait(self.poll_interval_seconds)
+
+
 def image_exists(image: str) -> bool:
     result = run_command(["docker", "image", "inspect", image], check=False)
     return result.returncode == 0
@@ -679,7 +713,7 @@ def load_challenge(runtime_env: dict[str, str], *, enable_challenge_mcp: bool = 
     challenge_description = maybe_decode_text(get_runtime_value(runtime_env, "CHALLENGE_DESCRIPTION"))
     challenge_hint = maybe_decode_text(get_runtime_value(runtime_env, "CHALLENGE_HINT"))
     challenge = {
-        "server_host": target_host,
+        "server_host": challenge_mcp_server if enable_challenge_mcp else "",
         "target_host": target_host,
         "challenge_mcp_enabled": enable_challenge_mcp,
         "challenge_mcp_server": challenge_mcp_server,
@@ -882,12 +916,80 @@ def initialize_workspace_claude_config(task_dir: Path) -> None:
         shutil.copytree(
             CLAUDE_TEMPLATE_DIR,
             claude_dir,
-            ignore=shutil.ignore_patterns("mcp.json", ".mcp.json", ".DS_Store", "__pycache__"),
+            ignore=shutil.ignore_patterns(
+                "mcp.json",
+                ".mcp.json",
+                CLAUDE_SETTINGS_NAME,
+                CLAUDE_HOOKS_DIR_NAME,
+                ".DS_Store",
+                "__pycache__",
+            ),
         )
     else:
         claude_dir.mkdir(parents=True, exist_ok=True)
 
     (claude_dir / "agents").mkdir(parents=True, exist_ok=True)
+
+
+def build_workspace_hook_settings() -> dict[str, object]:
+    hook_command = "python3 /home/kali/workspace/.claude/hooks/auto_submit_flag.py"
+    post_tool_matcher = (
+        "Agent|Task|SendMessage|Read|Grep|Glob|"
+        "mcp__sandbox__.*|mcp__platform__submit_flag|mcp__platform__view_hint"
+    )
+    return {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "mcp__platform__submit_flag",
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": post_tool_matcher,
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+            "PostToolUseFailure": [
+                {
+                    "matcher": "mcp__platform__submit_flag",
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+            "SubagentStop": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+            "StopFailure": [
+                {
+                    "hooks": [{"type": "command", "command": hook_command}],
+                }
+            ],
+        }
+    }
+
+
+def install_workspace_hooks(task_dir: Path) -> None:
+    claude_dir = task_dir / ".claude"
+    hooks_template_dir = CLAUDE_TEMPLATE_DIR / CLAUDE_HOOKS_DIR_NAME
+    hooks_target_dir = claude_dir / CLAUDE_HOOKS_DIR_NAME
+    settings_path = claude_dir / CLAUDE_SETTINGS_NAME
+
+    if hooks_template_dir.is_dir():
+        shutil.copytree(hooks_template_dir, hooks_target_dir, dirs_exist_ok=True)
+
+    settings_path.write_text(
+        json.dumps(build_workspace_hook_settings(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def write_claude_mcp_config(task_dir: Path, runtime_env: dict[str, str], challenge: dict[str, object]) -> Path:
@@ -942,12 +1044,14 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
             [
                 "- challenge MCP 已启用；当前只开放 `submit_flag` 与 `view_hint`。",
                 "- 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`，也不要把思路转向“先起题再拿入口”。",
+                "- 赛题 code 的唯一可信来源是 `/home/kali/workspace/.inputs/challenge.json` 里的 `challenge_code`（并与环境变量 `CHALLENGE_CODE` 对齐）；禁止从标题、描述、URL、中文文本或任何 slug 变体猜码。",
                 "- `view_hint` 只允许你这个 main agent 在明确阻塞时调用；不要下放给 subagent。",
                 "- 任意 agent 一旦拿到完整、可复核、来源明确的候选 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`；不要等回到 main agent 再转交。",
-                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；一旦出现一次 `correct=true`，当前这次 run 就立即视为成功，不再继续追该题的其它 flag。",
+                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；若 `flag_got_count < flag_count`，它只是部分命中，是否继续由 main agent 决定；只有该题已拿满 flag 点时，当前 run 才立即视为成功。",
                 "- 如果 `submit_flag` 返回错误，不要再次提交同一个 flag；把它视为已拒绝候选，回到证据驱动分析，只在存在其它高价值向量或一个明确缺失事实时继续推进。",
                 "- 任意 agent 收到 `correct=true` 后，都应立即写出最小结果文件 `/home/kali/workspace/.results/flag.txt` 与 `/home/kali/workspace/.results/final_report.md`，然后停止任务。",
-                "- 如果某个 subagent 已提交成功，main agent 后续只负责停止重复调度与重复提交，不再继续该题。",
+                "- 如果某个 subagent 已完整提交成功，main agent 后续只负责停止重复调度与重复提交，不再继续该题。",
+                "- workspace `.claude/settings.json` 中会挂载 `PreToolUse` / `PostToolUse` / `Stop` / `SubagentStop` hooks：`PreToolUse` 会硬禁止猜码提交，其他 hooks 会尝试自动补交真实 flag；这是兜底，不替代你的显式判断。",
             ]
         )
 
@@ -1244,9 +1348,10 @@ def build_run_command(
     challenge_env = {
         "CHALLENGE_CODE": str(challenge["challenge_code"]),
         "CHALLENGE_ENTRYPOINT": ",".join(str(item) for item in challenge["challenge_entrypoints"]),
+        "CHALLENGE_MCP_ENABLED": "1" if challenge.get("challenge_mcp_enabled") else "0",
     }
-    server_host_value = str(challenge["server_host"])
-    if server_host_value:
+    server_host_value = str(challenge.get("challenge_mcp_server") or "").strip()
+    if challenge.get("challenge_mcp_enabled") and server_host_value:
         challenge_env["SERVER_HOST"] = server_host_value
     if challenge["challenge_title"]:
         challenge_env["CHALLENGE_TITLE"] = str(challenge["challenge_title"])
@@ -1338,6 +1443,9 @@ def run_claude_task(
     ]
     watcher = AgentIdCaptureWatcher(task_dir)
     watcher.start()
+    success_watcher = SuccessfulFlagWatcher(task_dir, container_name) if challenge_mcp_enabled else None
+    if success_watcher is not None:
+        success_watcher.start()
     process = subprocess.Popen(command, stdin=subprocess.PIPE, text=True)
     try:
         process.communicate(prompt, timeout=timeout_seconds)
@@ -1362,8 +1470,12 @@ def run_claude_task(
         raise
     finally:
         watcher.stop()
+        if success_watcher is not None:
+            success_watcher.stop()
         if watcher.capture_count:
             print(f"[+] Runner captured {watcher.capture_count} Claude subagent agentId(s) into registry.")
+        if success_watcher is not None and success_watcher.triggered:
+            print("[+] Hook confirmed a correct flag submission; Claude was interrupted for fast shutdown.")
     return process.returncode or 0, False
 
 
@@ -1549,6 +1661,8 @@ def main() -> int:
         initialize_task_dirs(task_dir)
         write_challenge_snapshot(task_dir, challenge)
         initialize_workspace_claude_config(task_dir)
+        if challenge.get("challenge_mcp_enabled"):
+            install_workspace_hooks(task_dir)
         write_claude_mcp_config(task_dir, runtime_env, challenge)
         ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
         ensure_exploitation_report_index(task_dir)

@@ -101,6 +101,14 @@ python3 run_task.py --agent-mode single
 - `AGENT_TOKEN`
 - `CHALLENGE_CODE`
 
+当 challenge MCP 启用时，workspace `.claude/settings.json` 会在运行时动态生成，并挂载一组 hooks：
+
+- `PreToolUse`：对 `submit_flag` 做硬校验，只允许使用 `workspace/.inputs/challenge.json` 中的精确 `challenge_code`
+- `PostToolUse` / `Stop` / `SubagentStop`：尽量全面地扫描工具输出与最终回答中的真实 `flag{...}`，通过比赛 HTTP API 自动补交
+
+若自动补交返回完整成功（`correct=true` 且该题 flag 点已拿满），它会立即写出结果文件并触发 runner 尽快结束当前任务。若只是部分命中（多 Flag 题），则不会自动结束，是否继续由 main agent 决定。
+每次 hook 的判断、跳过原因、提交尝试与结果都会落到 `workspace/.results/flag_hook_events.jsonl`，方便排查自动提交链路。
+
 如果当前不是在比赛环境，或者暂时不希望接入比赛平台 MCP，可以显式关闭：
 
 ```bash

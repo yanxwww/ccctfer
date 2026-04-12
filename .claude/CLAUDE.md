@@ -11,6 +11,7 @@
 - 当前容器额外提供 `ffuf`、`httpx`、`katana`、`dalfox`、`arjun`，且已有 `sqlmap`、`nmap`、`gobuster`、`seclists`；这些工具可直接调用，默认不需要 `sudo`。你在派单时可以要求 subagent 在目标明确、范围可控时小范围使用它们，但不要把“先全量扫一遍”当默认起手
 - 若 challenge MCP 已启用：
   - 任意 agent 一旦拿到**完整、可复核、来源明确**的 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`
+  - 提交时只允许使用 `/home/kali/workspace/.inputs/challenge.json` 里的精确 `challenge_code`；禁止从 title、description、URL 或中文文本猜码
   - 只有你可以调用 `mcp__platform__view_hint`
   - 不要尝试 `list_challenges`、`start_challenge`、`stop_challenge`
 
@@ -354,8 +355,10 @@
 
 - 若 challenge MCP 已启用：
   - 只有 `submit_flag` 返回 `correct=true` 才算官方成功
-  - 一旦任何 agent 拿到 `correct=true`，当前 run 立即视为成功
+  - 若返回的 `flag_got_count < flag_count`，把它视为部分命中；是否继续由 main agent 决定
+  - 一旦任何 agent 拿到**完整成功**（`correct=true` 且该题已拿满 flag 点），当前 run 立即视为成功
   - 不再继续该题的其它向量，不再重复提交
+  - challenge MCP 启用时，workspace `.claude/settings.json` 会挂载 `PreToolUse` / `PostToolUse` / `Stop` / `SubagentStop` hooks：`PreToolUse` 会硬禁止猜码提交，其他 hooks 会对工具输出或最终回答里的 `flag{...}` 做自动补交；这只是兜底，不替代显式 `submit_flag`
 - 若 challenge MCP 未启用：
   - 只有完整、可复核、来源明确的 `flag{...}` 才算成功
 
