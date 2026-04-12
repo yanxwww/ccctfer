@@ -3,7 +3,7 @@
 一个基于 Docker 的 CTF 自动化执行框架：
 - 容器内启动 `python_terminal_mcp`（MCP 服务）
 - 使用 `run_task.py` 生成任务工作区并调用 `claude` 执行主流程
-- 默认使用多 agent 调度模式；可显式切换到单智能体精简模式做 A/B 或应急验证
+- 默认使用 main-agent 中心制的轻编排多 agent 调度模式；可显式切换到单智能体精简模式做 A/B 或应急验证
 - 默认通过 challenge MCP 为 main agent 接入比赛平台工具；如需关闭，显式传入 `--disable-challenge-mcp`
 
 ## 项目结构
@@ -89,7 +89,7 @@ ANTHROPIC_MODEL=your-model
 python3 run_task.py
 ```
 
-默认 `--agent-mode orchestrated`，使用 observation/exploitation 多 agent 框架。若需要做单智能体 A/B 或应急验证，可显式传入：
+默认 `--agent-mode orchestrated`，使用 **main agent 主控 + observation / exploitation subagent + 先 BFS 后 DFS** 的轻编排多 agent 框架。若需要做单智能体 A/B 或应急验证，可显式传入：
 
 ```bash
 python3 run_task.py --agent-mode single
@@ -101,13 +101,13 @@ python3 run_task.py --agent-mode single
 - `AGENT_TOKEN`
 - `CHALLENGE_CODE`
 
-当 challenge MCP 启用时，workspace `.claude/settings.json` 会在运行时动态生成，并挂载一组 hooks：
+当 challenge MCP 启用时，不再使用 hook 自动补交。现在的约定是：
 
-- `PreToolUse`：对 `submit_flag` 做硬校验，只允许使用 `workspace/.inputs/challenge.json` 中的精确 `challenge_code`
-- `PostToolUse` / `Stop` / `SubagentStop`：尽量全面地扫描工具输出与最终回答中的真实 `flag{...}`，通过比赛 HTTP API 自动补交
-
-若自动补交返回完整成功（`correct=true` 且该题 flag 点已拿满），它会立即写出结果文件并触发 runner 尽快结束当前任务。若只是部分命中（多 Flag 题），则不会自动结束，是否继续由 main agent 决定。
-每次 hook 的判断、跳过原因、提交尝试与结果都会落到 `workspace/.results/flag_hook_events.jsonl`，方便排查自动提交链路。
+- 任何 agent（包括 subagent）一旦发现完整、可复核、来源明确的 `flag{...}`，就立即直接调用 `mcp__platform__submit_flag`
+- `code` 只允许使用 `workspace/.inputs/challenge.json` 中的精确 `challenge_code`
+- 若返回 `correct=true`，或平台明确表示该 flag 已提交过 / 已获得 / `already submitted` / `already solved` 且该题已拿满 flag 点，就立即写结果文件并结束
+- 若只是部分命中（多 Flag 题），则不会自动结束，是否继续由 main agent 决定
+- 只有平台明确表示答案错误时，才把该 flag 视为判错；认证失败、赛题标识错误、限频、网络错误都不算 flag 判错
 
 如果当前不是在比赛环境，或者暂时不希望接入比赛平台 MCP，可以显式关闭：
 

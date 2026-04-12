@@ -33,8 +33,6 @@ AGENT_TEAMS_ENV_NAME = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 AGENT_TEAMS_ENV_VALUE = "1"
 ENV_FILE_PATH = REPO_ROOT / ".env"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
-CLAUDE_SETTINGS_NAME = "settings.json"
-CLAUDE_HOOKS_DIR_NAME = "hooks"
 INPUTS_DIR_NAME = ".inputs"
 REPORTS_DIR_NAME = "reports"
 EXPLOITATION_REPORTS_DIR_NAME = "exploitation"
@@ -52,12 +50,12 @@ EXPLOITATION_ARTIFACTS_RELATIVE_DIR = f"{ARTIFACTS_DIR_NAME}/{EXPLOITATION_REPOR
 RESULT_FLAG_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/flag.txt"
 RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
-HOOK_SUBMIT_SUCCESS_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/hook_submit_success.json"
-HOOK_SUBMIT_PARTIAL_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/hook_submit_partial.json"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
 SUBAGENT_REGISTRY_HELPER_RELATIVE_PATH = ".claude/tools/manage_subagent_registry.py"
 EXPLOITATION_INDEX_MERGER_RELATIVE_PATH = ".claude/tools/manage_exploitation_report.py"
 ARTIFACT_SUMMARIZER_RELATIVE_PATH = ".claude/tools/summarize_artifact.py"
+REGISTRY_SCHEMA_VERSION = 2
+OBSERVATION_REPORT_SCHEMA_VERSION = 2
 MAX_PARALLEL_EXPLOITATION = 2
 MAX_TOTAL_EXPLOITATION_SUBAGENTS = 5
 MAX_CONSECUTIVE_EMPTY_TERMINAL_READS = 3
@@ -71,6 +69,7 @@ FLAG_PATTERN = re.compile(r"flag\{[^\r\n]+\}")
 CLAUDE_AGENT_ID_PATTERN = re.compile(r"\bagentId:\s*([A-Za-z0-9_-]+)")
 DETAIL_REPORT_PATH_PATTERN = re.compile(r"/home/kali/workspace/(reports/exploitation/exploitation_[^\s`\"')]+\.json)")
 CANONICAL_OBSERVATION_ROOT_KEYS = {
+    "schema_version",
     "target",
     "surface_map",
     "evidence",
@@ -78,6 +77,8 @@ CANONICAL_OBSERVATION_ROOT_KEYS = {
     "negative_findings",
     "unknowns",
     "recommended_next_step",
+    "probe_matrix",
+    "decision_signals",
 }
 
 REQUIRED_CHALLENGE_ENV_KEYS = ["CHALLENGE_ENTRYPOINT"]
@@ -413,22 +414,42 @@ def lock_registry_file(path: Path):
 
 def load_registry_payload(path: Path) -> dict[str, object]:
     if not path.exists():
-        return {"observation_owner": {}, "exploitation_owners": []}
+        return {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "observation_owner": {},
+            "exploitation_owners": [],
+            "proposal_queue": [],
+        }
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"observation_owner": {}, "exploitation_owners": []}
+        return {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "observation_owner": {},
+            "exploitation_owners": [],
+            "proposal_queue": [],
+        }
     if not isinstance(payload, dict):
-        return {"observation_owner": {}, "exploitation_owners": []}
+        return {
+            "schema_version": REGISTRY_SCHEMA_VERSION,
+            "observation_owner": {},
+            "exploitation_owners": [],
+            "proposal_queue": [],
+        }
     observation_owner = payload.get("observation_owner")
     exploitation_owners = payload.get("exploitation_owners")
+    proposal_queue = payload.get("proposal_queue")
     if not isinstance(observation_owner, dict):
         observation_owner = {}
     if not isinstance(exploitation_owners, list):
         exploitation_owners = []
+    if not isinstance(proposal_queue, list):
+        proposal_queue = []
     return {
+        "schema_version": REGISTRY_SCHEMA_VERSION,
         "observation_owner": observation_owner,
         "exploitation_owners": [item for item in exploitation_owners if isinstance(item, dict)],
+        "proposal_queue": [item for item in proposal_queue if isinstance(item, dict)],
     }
 
 
@@ -479,6 +500,7 @@ def backfill_registry_owner_id(
     try:
         payload = load_registry_payload(registry_path)
         timestamp = now_utc_iso()
+        payload["schema_version"] = REGISTRY_SCHEMA_VERSION
         if role == "observation-subagent":
             observation_owner = payload.get("observation_owner")
             if not isinstance(observation_owner, dict):
@@ -621,36 +643,6 @@ class AgentIdCaptureWatcher:
         self._seen.add(key)
 
 
-class SuccessfulFlagWatcher:
-    def __init__(self, task_dir: Path, container_name: str, *, poll_interval_seconds: float = 0.5) -> None:
-        self.task_dir = task_dir
-        self.container_name = container_name
-        self.poll_interval_seconds = poll_interval_seconds
-        self.sentinel_path = task_dir / HOOK_SUBMIT_SUCCESS_RELATIVE_PATH
-        self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="flag-success-watcher", daemon=True)
-        self._triggered = False
-
-    @property
-    def triggered(self) -> bool:
-        return self._triggered
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._thread.join(timeout=max(1.0, self.poll_interval_seconds * 4))
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            if self.sentinel_path.exists():
-                self._triggered = True
-                interrupt_claude(self.container_name)
-                return
-            self._stop_event.wait(self.poll_interval_seconds)
-
-
 def image_exists(image: str) -> bool:
     result = run_command(["docker", "image", "inspect", image], check=False)
     return result.returncode == 0
@@ -746,7 +738,17 @@ def initialize_task_dirs(task_dir: Path) -> None:
     registry_path = task_dir / SUBAGENT_REGISTRY_RELATIVE_PATH
     if not registry_path.exists():
         registry_path.write_text(
-            json.dumps({"observation_owner": {}, "exploitation_owners": []}, ensure_ascii=False, indent=2) + "\n",
+            json.dumps(
+                {
+                    "schema_version": REGISTRY_SCHEMA_VERSION,
+                    "observation_owner": {},
+                    "exploitation_owners": [],
+                    "proposal_queue": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -755,6 +757,8 @@ def is_canonical_observation_payload(payload: object) -> bool:
     if not isinstance(payload, dict):
         return False
     if not CANONICAL_OBSERVATION_ROOT_KEYS.issubset(payload.keys()):
+        return False
+    if payload.get("schema_version") != OBSERVATION_REPORT_SCHEMA_VERSION:
         return False
     if not isinstance(payload.get("target"), dict):
         return False
@@ -769,6 +773,10 @@ def is_canonical_observation_payload(payload: object) -> bool:
     if not isinstance(payload.get("unknowns"), list):
         return False
     if not isinstance(payload.get("recommended_next_step"), dict):
+        return False
+    if not isinstance(payload.get("probe_matrix"), list):
+        return False
+    if not isinstance(payload.get("decision_signals"), list):
         return False
     return True
 
@@ -919,8 +927,8 @@ def initialize_workspace_claude_config(task_dir: Path) -> None:
             ignore=shutil.ignore_patterns(
                 "mcp.json",
                 ".mcp.json",
-                CLAUDE_SETTINGS_NAME,
-                CLAUDE_HOOKS_DIR_NAME,
+                "settings.json",
+                "hooks",
                 ".DS_Store",
                 "__pycache__",
             ),
@@ -929,68 +937,6 @@ def initialize_workspace_claude_config(task_dir: Path) -> None:
         claude_dir.mkdir(parents=True, exist_ok=True)
 
     (claude_dir / "agents").mkdir(parents=True, exist_ok=True)
-
-
-def build_workspace_hook_settings() -> dict[str, object]:
-    hook_command = "python3 /home/kali/workspace/.claude/hooks/auto_submit_flag.py"
-    post_tool_matcher = (
-        "Agent|Task|SendMessage|Read|Grep|Glob|"
-        "mcp__sandbox__.*|mcp__platform__submit_flag|mcp__platform__view_hint"
-    )
-    return {
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "mcp__platform__submit_flag",
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": post_tool_matcher,
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-            "PostToolUseFailure": [
-                {
-                    "matcher": "mcp__platform__submit_flag",
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-            "Stop": [
-                {
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-            "SubagentStop": [
-                {
-                    "matcher": "*",
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-            "StopFailure": [
-                {
-                    "hooks": [{"type": "command", "command": hook_command}],
-                }
-            ],
-        }
-    }
-
-
-def install_workspace_hooks(task_dir: Path) -> None:
-    claude_dir = task_dir / ".claude"
-    hooks_template_dir = CLAUDE_TEMPLATE_DIR / CLAUDE_HOOKS_DIR_NAME
-    hooks_target_dir = claude_dir / CLAUDE_HOOKS_DIR_NAME
-    settings_path = claude_dir / CLAUDE_SETTINGS_NAME
-
-    if hooks_template_dir.is_dir():
-        shutil.copytree(hooks_template_dir, hooks_target_dir, dirs_exist_ok=True)
-
-    settings_path.write_text(
-        json.dumps(build_workspace_hook_settings(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
 
 def write_claude_mcp_config(task_dir: Path, runtime_env: dict[str, str], challenge: dict[str, object]) -> Path:
     config_path = task_dir / ".claude" / CLAUDE_MCP_CONFIG_NAME
@@ -1047,11 +993,12 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
                 "- 赛题 code 的唯一可信来源是 `/home/kali/workspace/.inputs/challenge.json` 里的 `challenge_code`（并与环境变量 `CHALLENGE_CODE` 对齐）；禁止从标题、描述、URL、中文文本或任何 slug 变体猜码。",
                 "- `view_hint` 只允许你这个 main agent 在明确阻塞时调用；不要下放给 subagent。",
                 "- 任意 agent 一旦拿到完整、可复核、来源明确的候选 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`；不要等回到 main agent 再转交。",
-                "- 只有 `submit_flag` 返回 `correct=true` 才算官方成功；若 `flag_got_count < flag_count`，它只是部分命中，是否继续由 main agent 决定；只有该题已拿满 flag 点时，当前 run 才立即视为成功。",
-                "- 如果 `submit_flag` 返回错误，不要再次提交同一个 flag；把它视为已拒绝候选，回到证据驱动分析，只在存在其它高价值向量或一个明确缺失事实时继续推进。",
-                "- 任意 agent 收到 `correct=true` 后，都应立即写出最小结果文件 `/home/kali/workspace/.results/flag.txt` 与 `/home/kali/workspace/.results/final_report.md`，然后停止任务。",
+                "- `submit_flag` 返回 `correct=true` 时，它就是官方成功；若 `flag_got_count < flag_count`，它只是部分命中，是否继续由 main agent 决定；只有该题已拿满 flag 点时，当前 run 才立即视为成功。",
+                "- 如果 `submit_flag` 的返回明确表示这个 flag 已经提交过、已获得，或 `already submitted` / `already solved`，把它视为该 flag 已被官方验证成功，而不是答案错误；若该题已拿满 flag 点则立即结束，否则视为部分命中。",
+                "- 只有平台明确表示答案错误时，才把该 flag 视为已拒绝候选；认证失败、赛题标识错误、限频、网络错误都不算 flag 判错。",
+                "- 任意 agent 收到完整成功，或明确的“该 flag 已提交过/已获得”且该题已拿满 flag 点后，都应立即写出最小结果文件 `/home/kali/workspace/.results/flag.txt` 与 `/home/kali/workspace/.results/final_report.md`，然后停止任务。",
                 "- 如果某个 subagent 已完整提交成功，main agent 后续只负责停止重复调度与重复提交，不再继续该题。",
-                "- workspace `.claude/settings.json` 中会挂载 `PreToolUse` / `PostToolUse` / `Stop` / `SubagentStop` hooks：`PreToolUse` 会硬禁止猜码提交，其他 hooks 会尝试自动补交真实 flag；这是兜底，不替代你的显式判断。",
+                "- 当前 run 不依赖 hook 自动补交；发现 flag 的那个 agent 自己负责立刻调用 `mcp__platform__submit_flag`。",
             ]
         )
 
@@ -1094,7 +1041,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
             f"- description: {challenge['challenge_description'] or '(未提供)'}",
             f"- hint: {challenge['challenge_hint'] or '(未提供)'}",
             "",
-            "现在开始：先读取题目 JSON，然后直接解题；若拿到完整 flag 且 challenge MCP 可用，立即提交，`correct=true` 后立刻结束。",
+            "现在开始：先读取题目 JSON，然后直接解题；若拿到完整 flag 且 challenge MCP 可用，立即提交；`correct=true` 或平台明确表示该 flag 已提交过且该题已拿满 flag 点时，立刻结束。",
         ]
         return "\n".join(prompt_lines)
 
@@ -1103,67 +1050,17 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "先读取 `~/.claude/CLAUDE.md` 并严格执行；这里只补充本轮题目与会话级参数。",
         "",
         "本轮会话级约束：",
-        "- 固定状态机：`initial_observation -> targeted_exploitation -> optional_finalization`；只有 exploitation 明确缺少某个具体事实时，才允许一次 `supplemental_observation`。",
+        "- 你是唯一决策者；subagent 只有执行权和提案权，没有裁决权。",
+        "- 默认骨架仍然是：`main agent + 多 subagent + 先 BFS 再 DFS`。",
+        "- 若 `reports/subagent_registry.json.proposal_queue` 中存在未决 proposal，先处理 proposal，再继续 BFS / DFS。",
+        "- proposal 只允许：`fact_challenge`、`parameter_challenge`、`decisive_payload_family`、`bridge_gap`。",
+        "- main agent 自己不执行任何 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
         "- 起步只允许 1 个 `observation-subagent`。",
-        "- observation 一旦达到可利用 checkpoint，就应先结束当前轮并把主文件交回；不要为了“还能多收集一些背景”而继续独占时间片。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
-        "- 创建 subagent 时必须显式设置 `subagent_type` 为 `observation-subagent` 或 `exploitation-subagent`，不要使用泛型/default agent 执行 CTF 任务。",
-        "- 给 subagent 的派单第一行必须写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`。",
-        "- 不要在 subagent 派单里写“你是 main agent”“按照 main agent 状态机调度”等字样；`~/.claude/CLAUDE.md` 的 main-only 调度规则只由你使用。",
-        "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链默认优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",
-        "- 原则是：可以新开，但必须优先复用已有 owner；新开是兜底，不是默认动作。",
-        "- main agent 的固定决策顺序是：先判断复用；复用不适合则判断替换；只有替换也不适合时才新开。",
-        "- 如果 `Agent` / `Task` tool_result 已返回 `agentId` 并提示可用 `SendMessage` 继续，把这个 `agentId` 视为这条链的默认 `owner_id`，它也是后续精确恢复该 owner 的默认 `SendMessage` 目标。",
-        "- 如果 `Agent` / `Task` tool_result 以文本形式出现 `agentId: <value>`，你必须直接提取这个字面值，并用 `SendMessage(to=<value>)`；不要声称“没看到 agentId”后再改走其它标识。",
-        "- `Agent` / `Task` tool_result 可能包含多个 text block；在判断“是否拿到 agentId”前，必须检查全部 text block，而不是只看第一个 checkpoint 摘要块。",
-        "- 每次 `Agent` / `Task` 返回后，你的下一步固定动作就是 owner capture：先检查全部 text block，字面提取 `agentId: <value>`，立刻把它当成当前链的 `owner_id`；如果 text block 里没拿到 `agentId`，立刻刷新一次 registry，launcher 可能已从结构化 `Agent` tool_result 回填 exact `owner_id`；在做完这一步之前，不要先去读报告、或继续派单。",
-        "- 一旦某个 text block 已出现 `agentId:`，不要再写“没看到 agentId”；直接使用该字面值推进 `SendMessage(to=<owner_id>)`。",
-        "- 如果 text block 没有 `agentId:`，但 registry 已出现当前链的 exact `owner_id`，直接使用 registry 里的值继续 `SendMessage`。",
-        "- 只有当你既没能从 `Agent` / `Task` tool_result、也没能从 registry 拿到 Claude `agentId` 时，才应明确报告 exact owner_id 当前不可用；不要改用 role alias、自定义 name、`mcp__sandbox__python_exec` / `shell_exec` / `list_agent_runtimes` 里的 `agent_id`、`runtime_key`、`member_agent_ids` 来凑 SendMessage 目标。",
-        "- `SendMessage` 使用的 exact `owner_id`，只认 `Agent` / `Task` tool_result 返回的 Claude subagent `agentId`；不要把 `mcp__sandbox__python_exec` / `shell_exec` / `list_agent_runtimes` 里的 `agent_id`、`runtime_key`、`member_agent_ids` 当成 SendMessage 目标。",
-        "- subagent 的 `name` / `summary` / 自定义别名，只能辅助阅读；它们不等于 exact owner_id，不应用作“已验证的精确恢复目标”。",
-        "- 新建一个你预计会复用的 owner 后，尽快补一条极短 `SendMessage(to=<owner_id>)`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填给该 owner，让它写入 registry；否则 registry 只能防重复，不能稳定辅助恢复。",
-        "- 向 `observation-subagent` / `exploitation-subagent` 这类 role alias 发消息，不算稳定复用具体 owner；同链续跑默认使用 exact `owner_id`，只有拿不到 `owner_id` 时才进入替换 / 新开判断。",
-        "- 如果当前环境支持 Agent Teams / resume，owner 暂停时优先恢复原 owner；只有无法继续时才新开 agent。",
-        "- `supplemental_observation` 默认优先 `SendMessage` 继续原 observation owner，而不是新开 observation sibling。",
-        "- 对 observation 的 initial checkpoint 或补一个具体事实这类窄任务，派单时要显式写出：`stage`、`vector_slug=observation`、helper 路径、停止条件，并要求 owner 尽量用一次自包含 `python_exec` 完成探测、artifact、update merge、registry 更新和最终 summary。",
-        f"- `subagent registry` 是 owner 台账：创建或继续 subagent 前先读 `{subagent_registry_path}`；不要只靠临时记忆决定是否新开 sibling。",
-        f"- 新建或继续 subagent 的派单里必须包含 `vector_slug`、目标 stage、status、detail 路径，并要求它用 `{subagent_registry_helper_path}` 在开始和结束时更新 registry。",
-        "- 同一 `vector_slug` / 同一 detail JSON 已有 exact `owner_id` 时，默认用 `SendMessage(to=<owner_id>)` 继续；只有 owner 明确不可恢复、`owner_id` 缺失、或继续收益明显更差时，才允许新开替代 agent。",
-        "- observation 只允许一个长期 owner；如果 registry 或当前会话里已有 observation owner，默认继续它。",
-        "- 先做复用审查：同一 detail / 同一 hypothesis / 同一 vector_slug 是否已有 exact `owner_id`；当前任务是否只是原链路下一步、补证、deepen、bridge check。若是，默认优先 `SendMessage(to=<owner_id>)` 继续原 owner。",
-        "- 若复用不适合，再做替换审查：只有旧 owner 明显上下文污染、上下文过厚、runtime 异常、连续漏关键点、`owner_id` 缺失无法精确恢复，或任务形态已改变时，才允许为同链路新开替代 owner。",
-        "- 只有当任务本身是独立新链路，而不是原链路继续或替代时，才新开全新 `Agent`。",
-        "- 任意时刻最多只允许 1 个 observation owner；只要它还能恢复，就禁止新开 observation sibling。",
-        "- 如果 registry 显示活跃 exploitation owner 已达到并发上限，禁止继续新开 `Agent`；你只能先审阅已有结果、等待返回，或 `SendMessage` 续跑原 owner。",
-        "- 在尚未读取任何一个新增 exploitation detail 报告前，不要连续新开超过 2 个 exploitation owner；先看结果，再决定下一批。",
-        "- 对同一 endpoint / 同一 hypothesis / 同一 detail 链，默认只允许 1 个 active owner；只有原 owner 已明确证明存在正向 capability 且必须拆下一跳时，才允许分裂 sibling。",
-        "- 给 exploitation 派单时必须写清“只验证到哪一步就停止”；不要让 subagent 自行升级到更深验证。若你需要进一步探索，默认先 `SendMessage(to=<owner_id>)` 唤醒同一 owner 并给新的窄任务说明；只有 owner 不适合继续时才替换或新开。",
-        "- `summary.priority_actions` 是候选队列，不是自动派单列表；新开 exploitation 前先做一次轻量四因子判断：证据强度、独立性/链路契合、预期收益、预计成本。",
-        "- 默认只并行高收益且低/中成本的前 1-2 个动作；高噪声枚举、大范围 brute force、需要消化大量正文的动作，除非能闭合一条 `ready_for_validation` / `in_progress` 组合链，否则不要占用默认并行位。",
-        "- 如果当前同时存在 2 个彼此独立且高价值的 exploitation 动作，先把这 2 个都派出去；不要串行等第 1 个结束后才决定第 2 个，除非第 2 个确实依赖第 1 个结果。",
-        "- 先把候选 exploitation 按独立利用族分组（如上传 / 认证 / 模板 / 文件读 / 会话 / API 注入）；BFS 的目标是让不同利用族先各完成一轮首轮浅验证，而不是让同一利用族并发很多 payload 变体。",
-        "- `targeted_exploitation` 起步优先做一轮广度优先的 initial exploitation wave：先让更多独立高价值向量完成首轮浅验证，再决定谁值得深挖。",
-        "- 首轮浅验证阶段，同一利用族默认只保留 1 个 active owner；不要在同一族里同时开多个 sibling 去做相似测试，除非 main 明确判定它们已经分化成独立链路。",
-        "- 只要队列里还有尚未做首轮验证的高价值独立向量，就不要急着把并行位长期占给同一条链的深度 follow-up；优先补齐这些首轮 exploitation。",
-        "- 只有当高价值独立向量的首轮验证基本完成，或某条链已出现强阳性信号并且再走一步就可能直接拿到 flag / file read / code exec 时，才优先深挖该链。",
-        "- 默认主流程是先 BFS、后 DFS：BFS 用来筛出每个独立利用族里最值得继续的链；DFS 只对最可行的 1-2 条链深入到 exploit / retrieval / flag。",
-        "- 进入 DFS 后，优先复用该链已有 owner；只有原 owner 不适合继续时才替换 owner，不要一进入深挖就机械新开 agent。",
-        "- 漏洞测试默认采用 BFS / 渐进式策略：先做 existence check，再做 bridge check，最后才做 exploit / retrieval；目标是尽快排除错误路径、收敛正确路径，而不是一开始就把单个向量挖到最深。",
-        "- observation 达到 checkpoint 后的停止表示“本轮暂停并交棒”，不是 observation 生命周期终止；但是否续跑必须重新过边界检查，而不是默认继续。",
-        "- 只有当 exploitation detail 明确缺少一个具体事实、或 observation 主文件已记录一个边界清晰且与当前开放链直接相关的 bridge / surface 时，才继续原 observation owner。",
-        "- 不要仅因为“可能还有更多 surface”“当前 exploitation 队列未满”或“可以顺手做目录/静态枚举”就续跑 observation owner。",
-        "- observation 审查优先看：`recommended_next_step` 与 `hypotheses[*].combines_with`。",
-        "- exploitation 审查优先看总表：`summary.key_facts`、`summary.confirmed_capabilities`、`summary.composed_chains`、`summary.priority_actions`。",
-        "- 新开 exploitation 分支前先确认：向量独立、detail 路径唯一、endpoint/参数/范围/停止条件能一句话说清。",
-        "- `failed` / `blocked` / `exhausted` 不是终判；若缺少前提、连接条件、触发点或观测证据，把它视为 `attempted_but_incomplete`，优先继续同一 owner。",
-        "- main agent 自己不执行 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
-        "- 派单时要要求 subagent：短/中任务优先一次性 `python_exec` + artifact / summary，不要默认后台执行后多次 `python_output` 轮询。",
-        "- observation checkpoint / supplemental fact 这类窄任务，不要让 owner 先探测完再慢慢收尾；优先要求它在同一次自包含 `python_exec` 里完成：收集 -> 写 artifact -> 写 update JSON -> merge 主文件 -> 更新 registry -> 打印最小 summary。",
-        "- 非 finalization 阶段不读 `.results/*`；不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`。",
-        "- 只能围绕 `challenge.json` 里的 entrypoint 及同 host 派单；除非 entrypoint 本身就是 localhost，否则不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标。",
-        "- 容器内 `localhost:8000` 是 sandbox MCP 服务，不是 CTF 目标；如果 entrypoint 不可达，写 blocker / `needs_more_observation`，不要派单去扫描本地端口或 MCP 服务。",
-        "- helper 写完报告后不要整份回读；只有确实缺字段时再做按字段提取。",
+        "- observation 只做收集式测试：baseline + 最多 3 个 classifier probes；出现 anomaly 就 checkpoint，不顺手追 exploit。",
+        "- subagent 发现冲突或决定性 family 时，只能写 proposal，不能自己冻结、换路或继续扩线。",
+        "- challenge 的默认复验者是原 owner；只有 owner 污染、无法恢复或连续两次被证伪时才替换。",
+        "- 给 subagent 的派单必须短，并显式写：角色、stage、目标、预算、停止条件、输出路径。",
         *challenge_mcp_lines,
         "",
         "关键路径：",
@@ -1180,15 +1077,26 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         f"- exploitation artifacts: `{exploitation_artifacts_dir}`",
         f"- results dir: `/home/kali/workspace/{RESULTS_DIR_NAME}/`",
         "",
-        f"题目标题：{challenge['challenge_title']}",
-        f"题目描述：{description}",
-        f"题目提示：{hint}",
-        f"目标主机：{challenge['target_host']}",
-        f"题目标识：{challenge['challenge_code']}",
-        "入口点：",
+        "registry helper v2：",
+        f"- owner upsert: `python3 {subagent_registry_helper_path} owner upsert ...`",
+        f"- proposal raise: `python3 {subagent_registry_helper_path} proposal raise ...`",
+        "- proposal decide / resolve 只能由你决定，再交给 subagent 执行写回。",
+        "",
+        "题目信息：",
+        f"- title: {challenge['challenge_title']}",
+        f"- code: {challenge['challenge_code']}",
+        f"- target_host: {challenge['target_host']}",
+        f"- description: {description}",
+        f"- hint: {hint}",
+        "- entrypoints:",
         entrypoint_lines,
         "",
-        "现在开始：先读取 challenge JSON，再启动 1 个 `observation-subagent`。只要它产出第一个可利用 checkpoint，就立刻进入 exploitation 调度；若有两个独立高价值动作，优先并行派出，并先完成一轮广度优先的浅验证。checkpoint 不是 observation 的终局；但后续只有在存在明确缺失事实或边界清晰的桥接任务时，才继续同一 observation owner。",
+        "现在开始：",
+        "1. 先读取 challenge JSON、observation report、exploitation index、subagent registry。",
+        "2. 若 proposal queue 有未决项，先裁决 proposal。",
+        "3. 启动 1 个 observation owner 做收集式测试。",
+        "4. observation 一旦给出 checkpoint，就进入 exploitation 的 BFS wave。",
+        "5. 只有在未决 proposal 为空且独立高价值向量首轮验证基本完成后，才进入 DFS。",
     ]
 
     if challenge_mcp_enabled:
@@ -1405,7 +1313,7 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False, agent_mod
         allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
     else:
         visible_tools = [*base_tools, *platform_tool_names]
-        allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
+        allowed_tools = [*base_tools, *platform_tool_names]
 
     tools = ",".join(visible_tools)
     allowed_tools_text = " ".join(allowed_tools)
@@ -1443,9 +1351,6 @@ def run_claude_task(
     ]
     watcher = AgentIdCaptureWatcher(task_dir)
     watcher.start()
-    success_watcher = SuccessfulFlagWatcher(task_dir, container_name) if challenge_mcp_enabled else None
-    if success_watcher is not None:
-        success_watcher.start()
     process = subprocess.Popen(command, stdin=subprocess.PIPE, text=True)
     try:
         process.communicate(prompt, timeout=timeout_seconds)
@@ -1470,12 +1375,8 @@ def run_claude_task(
         raise
     finally:
         watcher.stop()
-        if success_watcher is not None:
-            success_watcher.stop()
         if watcher.capture_count:
             print(f"[+] Runner captured {watcher.capture_count} Claude subagent agentId(s) into registry.")
-        if success_watcher is not None and success_watcher.triggered:
-            print("[+] Hook confirmed a correct flag submission; Claude was interrupted for fast shutdown.")
     return process.returncode or 0, False
 
 
@@ -1661,8 +1562,6 @@ def main() -> int:
         initialize_task_dirs(task_dir)
         write_challenge_snapshot(task_dir, challenge)
         initialize_workspace_claude_config(task_dir)
-        if challenge.get("challenge_mcp_enabled"):
-            install_workspace_hooks(task_dir)
         write_claude_mcp_config(task_dir, runtime_env, challenge)
         ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
         ensure_exploitation_report_index(task_dir)

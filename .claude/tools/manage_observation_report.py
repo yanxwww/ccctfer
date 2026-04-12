@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+SCHEMA_VERSION = 2
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge incremental observation data into the canonical report.")
@@ -27,6 +29,7 @@ def parse_args() -> argparse.Namespace:
 
 def empty_report() -> dict[str, Any]:
     return {
+        "schema_version": SCHEMA_VERSION,
         "target": {
             "scope": [],
             "entrypoints": [],
@@ -53,10 +56,13 @@ def empty_report() -> dict[str, Any]:
         "negative_findings": [],
         "unknowns": [],
         "recommended_next_step": {},
+        "probe_matrix": [],
+        "decision_signals": [],
     }
 
 
 CANONICAL_ROOT_KEYS = {
+    "schema_version",
     "target",
     "surface_map",
     "evidence",
@@ -64,6 +70,8 @@ CANONICAL_ROOT_KEYS = {
     "negative_findings",
     "unknowns",
     "recommended_next_step",
+    "probe_matrix",
+    "decision_signals",
 }
 
 
@@ -123,6 +131,13 @@ def normalize_path(value: Any) -> str:
 
 def normalize_name(value: Any) -> str:
     return collapse_text(value).lower()
+
+
+def normalize_slug(value: Any) -> str:
+    text = normalize_name(value)
+    text = re.sub(r"[^a-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text
 
 
 def normalize_scalar(value: Any) -> str:
@@ -208,6 +223,10 @@ def is_canonical_report(value: Any) -> bool:
     if not isinstance(value.get("unknowns"), list):
         return False
     if not isinstance(value.get("recommended_next_step"), dict):
+        return False
+    if not isinstance(value.get("probe_matrix"), list):
+        return False
+    if not isinstance(value.get("decision_signals"), list):
         return False
     return True
 
@@ -299,6 +318,94 @@ def coerce_hypothesis(item: Any) -> dict[str, Any] | None:
     return hypothesis
 
 
+def coerce_probe_entry(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        entry = copy.deepcopy(item)
+    else:
+        text = collapse_text(item)
+        if not text:
+            return None
+        entry = {"label": text}
+    normalized = {
+        "label": collapse_text(entry.get("label") or entry.get("name") or entry.get("probe")),
+        "endpoint": normalize_path(entry.get("endpoint") or entry.get("path") or entry.get("url")),
+        "parameter": collapse_text(entry.get("parameter") or entry.get("field") or entry.get("name")),
+        "classification": collapse_text(entry.get("classification") or entry.get("result") or entry.get("type")),
+        "observation": collapse_text(entry.get("observation") or entry.get("summary") or entry.get("note")),
+    }
+    compacted = {key: value for key, value in normalized.items() if value}
+    return compacted or None
+
+
+def coerce_decision_signal(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        entry = copy.deepcopy(item)
+    else:
+        text = collapse_text(item)
+        if not text:
+            return None
+        entry = {"summary": text}
+    kind = collapse_text(entry.get("kind") or entry.get("type") or entry.get("signal")).lower().replace("-", "_")
+    summary = collapse_text(entry.get("summary") or entry.get("note") or entry.get("claim") or entry.get("description"))
+    if not kind and not summary:
+        return None
+    normalized = {
+        "kind": kind or "observation_signal",
+        "status": collapse_text(entry.get("status") or "proposed").lower().replace("-", "_"),
+        "summary": summary,
+        "vector_slug": normalize_name(entry.get("vector_slug") or entry.get("family")),
+        "endpoint": normalize_path(entry.get("endpoint") or entry.get("path") or entry.get("url")),
+        "parameter": collapse_text(entry.get("parameter") or entry.get("field")),
+        "artifact_ref": normalize_path(entry.get("artifact_ref") or entry.get("artifact") or entry.get("path_ref")),
+    }
+    return {key: value for key, value in normalized.items() if value}
+
+
+def normalize_recommended_next_step(value: Any, hypotheses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    known_hypotheses = hypotheses or []
+    first_hypothesis = ""
+    for item in known_hypotheses:
+        hypothesis_id = collapse_text(item.get("id"))
+        if hypothesis_id:
+            first_hypothesis = hypothesis_id
+            break
+
+    if isinstance(value, dict):
+        action_text = collapse_text(
+            value.get("stop_condition")
+            or value.get("action")
+            or value.get("description")
+            or value.get("summary")
+            or value.get("notes")
+        )
+        normalized = {
+            "kind": collapse_text(value.get("kind") or value.get("type") or "exploitation_followup").lower().replace("-", "_"),
+            "vector_slug": normalize_slug(
+                value.get("vector_slug") or value.get("slug") or value.get("priority_hypothesis") or first_hypothesis
+            )
+            if collapse_text(value.get("vector_slug") or value.get("slug") or value.get("priority_hypothesis") or first_hypothesis)
+            else "",
+            "target_role": collapse_text(value.get("target_role") or "exploitation-subagent"),
+            "endpoint": normalize_path(value.get("endpoint") or value.get("path") or value.get("url")),
+            "stop_condition": action_text,
+        }
+        return {key: field for key, field in normalized.items() if field}
+
+    next_steps: list[str] = []
+    for item in ensure_list(value):
+        text = collapse_text(item)
+        if text:
+            next_steps.append(text)
+    if not next_steps:
+        return {}
+    return {
+        "kind": "exploitation_followup",
+        **({"vector_slug": normalize_slug(first_hypothesis)} if first_hypothesis else {}),
+        "target_role": "exploitation-subagent",
+        "stop_condition": next_steps[0],
+    }
+
+
 def coerce_endpoint_record(path_value: Any, payload: Any) -> tuple[str, dict[str, Any]] | None:
     if isinstance(payload, dict):
         record = copy.deepcopy(payload)
@@ -358,15 +465,20 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
         return empty_report()
 
     report = empty_report()
+    report["schema_version"] = SCHEMA_VERSION
 
     for key in CANONICAL_ROOT_KEYS:
         value = payload.get(key)
         if key not in payload:
             continue
-        if key in {"surface_map", "recommended_next_step"} and isinstance(value, dict):
+        if key == "schema_version":
+            continue
+        if key in {"surface_map"} and isinstance(value, dict):
             report[key] = copy.deepcopy(value)
-        elif key in {"evidence", "hypotheses", "negative_findings", "unknowns"} and isinstance(value, list):
+        elif key in {"evidence", "hypotheses", "negative_findings", "unknowns", "probe_matrix", "decision_signals"} and isinstance(value, list):
             report[key] = copy.deepcopy(value)
+        elif key == "recommended_next_step":
+            report[key] = normalize_recommended_next_step(value, report.get("hypotheses", []))
 
     target_value = payload.get("target")
     if isinstance(target_value, str):
@@ -432,6 +544,26 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
             if normalized:
                 report["hypotheses"].append(normalized)
 
+    for probe_group in (
+        payload.get("probe_matrix"),
+        findings.get("probe_matrix"),
+        findings.get("classifier_probes"),
+    ):
+        for item in ensure_list(probe_group):
+            normalized = coerce_probe_entry(item)
+            if normalized:
+                report["probe_matrix"].append(normalized)
+
+    for signal_group in (
+        payload.get("decision_signals"),
+        findings.get("decision_signals"),
+        findings.get("signals"),
+    ):
+        for item in ensure_list(signal_group):
+            normalized = coerce_decision_signal(item)
+            if normalized:
+                report["decision_signals"].append(normalized)
+
     for list_key, source_name, note_type in (
         ("known_facts", "legacy.findings.known_facts", "legacy_fact"),
         ("technical_constraints", "legacy.findings.technical_constraints", "technical_constraint"),
@@ -467,9 +599,8 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
         )
 
     recommended_next_step = payload.get("recommended_next_step")
-    if isinstance(recommended_next_step, dict):
-        report["recommended_next_step"] = copy.deepcopy(recommended_next_step)
-    else:
+    next_step = normalize_recommended_next_step(recommended_next_step, report["hypotheses"])
+    if not next_step:
         next_steps: list[str] = []
         for key in ("recommendation", "recommended_next_step", "next_steps"):
             value = payload.get(key)
@@ -481,18 +612,8 @@ def coerce_to_canonical(payload: Any) -> dict[str, Any]:
             summary_next_steps = payload["summary"].get("next_steps")
             if isinstance(summary_next_steps, list):
                 next_steps.extend(collapse_text(item) for item in summary_next_steps if collapse_text(item))
-        if next_steps:
-            first_hypothesis_id = ""
-            for item in report["hypotheses"]:
-                hypothesis_id = collapse_text(item.get("id"))
-                if hypothesis_id:
-                    first_hypothesis_id = hypothesis_id
-                    break
-            report["recommended_next_step"] = {
-                "action": next_steps[0],
-                "notes": next_steps,
-                **({"priority_hypothesis": first_hypothesis_id} if first_hypothesis_id else {}),
-            }
+        next_step = normalize_recommended_next_step(next_steps, report["hypotheses"])
+    report["recommended_next_step"] = next_step
 
     return merge_report(empty_report(), report)
 
@@ -592,6 +713,29 @@ def evidence_key(item: dict[str, Any]) -> str:
 
 def hypothesis_key(item: dict[str, Any]) -> str:
     return "|".join([normalize_name(item.get("family")), normalize_name(item.get("claim"))])
+
+
+def probe_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            normalize_name(item.get("label")),
+            normalize_path(item.get("endpoint")),
+            normalize_name(item.get("parameter")),
+            normalize_name(item.get("classification")),
+        ]
+    )
+
+
+def decision_signal_key(item: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            normalize_name(item.get("kind")),
+            normalize_name(item.get("vector_slug")),
+            normalize_path(item.get("endpoint")),
+            normalize_name(item.get("parameter")),
+            normalize_name(item.get("summary")),
+        ]
+    )
 
 
 def page_key(item: Any) -> str:
@@ -824,6 +968,7 @@ def merge_target(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
 def merge_report(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     report = empty_report()
     report.update(copy.deepcopy(existing))
+    report["schema_version"] = SCHEMA_VERSION
     report["target"] = merge_target(report.get("target", {}), incoming.get("target", {}))
     report["surface_map"] = merge_surface_map(report.get("surface_map", {}), incoming.get("surface_map", {}))
     report["evidence"] = merge_record_list(
@@ -845,13 +990,22 @@ def merge_report(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
         negative_finding_key,
     )
     report["unknowns"] = merge_scalar_lists(report.get("unknowns", []), incoming.get("unknowns", []), normalize_name)
+    report["probe_matrix"] = merge_record_list(
+        report.get("probe_matrix", []),
+        incoming.get("probe_matrix", []),
+        key_fn=probe_key,
+        coerce_item=coerce_probe_entry,
+    )
+    report["decision_signals"] = merge_record_list(
+        report.get("decision_signals", []),
+        incoming.get("decision_signals", []),
+        key_fn=decision_signal_key,
+        coerce_item=coerce_decision_signal,
+    )
 
-    incoming_next = incoming.get("recommended_next_step") or {}
+    incoming_next = normalize_recommended_next_step(incoming.get("recommended_next_step") or {}, report.get("hypotheses", []))
     if incoming_next:
-        priority = incoming_next.get("priority_hypothesis")
-        known_ids = {item.get("id") for item in report.get("hypotheses", [])}
-        if not priority or priority in known_ids:
-            report["recommended_next_step"] = copy.deepcopy(incoming_next)
+        report["recommended_next_step"] = copy.deepcopy(incoming_next)
 
     report["evidence"] = ensure_unique_ids(report.get("evidence", []), "ev")
     report["hypotheses"] = ensure_unique_ids(report.get("hypotheses", []), "h")
