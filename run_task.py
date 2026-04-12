@@ -38,6 +38,7 @@ OBSERVATION_ARTIFACTS_DIR_NAME = "observation"
 RESULTS_DIR_NAME = ".results"
 INPUT_CHALLENGE_RELATIVE_PATH = f"{INPUTS_DIR_NAME}/challenge.json"
 OBSERVATION_REPORT_RELATIVE_PATH = f"{REPORTS_DIR_NAME}/observation_report.json"
+SUBAGENT_REGISTRY_RELATIVE_PATH = f"{REPORTS_DIR_NAME}/subagent_registry.json"
 EXPLOITATION_REPORTS_RELATIVE_DIR = f"{REPORTS_DIR_NAME}/{EXPLOITATION_REPORTS_DIR_NAME}"
 EXPLOITATION_MASTER_REPORT_RELATIVE_PATH = f"{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_report.json"
 EXPLOITATION_DETAIL_PATTERN_RELATIVE_PATH = f"{EXPLOITATION_REPORTS_RELATIVE_DIR}/exploitation_<slug>.json"
@@ -47,6 +48,7 @@ RESULT_FLAG_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/flag.txt"
 RESULT_FINAL_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/final_report.md"
 RESULT_BLOCKER_REPORT_RELATIVE_PATH = f"{RESULTS_DIR_NAME}/blocker_report.md"
 OBSERVATION_MERGER_RELATIVE_PATH = ".claude/tools/manage_observation_report.py"
+SUBAGENT_REGISTRY_HELPER_RELATIVE_PATH = ".claude/tools/manage_subagent_registry.py"
 EXPLOITATION_INDEX_MERGER_RELATIVE_PATH = ".claude/tools/manage_exploitation_report.py"
 ARTIFACT_SUMMARIZER_RELATIVE_PATH = ".claude/tools/summarize_artifact.py"
 MAX_PARALLEL_EXPLOITATION = 2
@@ -428,6 +430,12 @@ def initialize_task_dirs(task_dir: Path) -> None:
     (task_dir / ARTIFACTS_DIR_NAME / OBSERVATION_ARTIFACTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
     (task_dir / ARTIFACTS_DIR_NAME / EXPLOITATION_REPORTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
     (task_dir / RESULTS_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    registry_path = task_dir / SUBAGENT_REGISTRY_RELATIVE_PATH
+    if not registry_path.exists():
+        registry_path.write_text(
+            json.dumps({"observation_owner": {}, "exploitation_owners": []}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def is_canonical_observation_payload(payload: object) -> bool:
@@ -636,6 +644,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
     hint = str(challenge["challenge_hint"]).strip() or "未提供"
     input_challenge_path = f"/home/kali/workspace/{INPUT_CHALLENGE_RELATIVE_PATH}"
     observation_report_path = f"/home/kali/workspace/{OBSERVATION_REPORT_RELATIVE_PATH}"
+    subagent_registry_path = f"/home/kali/workspace/{SUBAGENT_REGISTRY_RELATIVE_PATH}"
     exploitation_master_report_path = f"/home/kali/workspace/{EXPLOITATION_MASTER_REPORT_RELATIVE_PATH}"
     exploitation_detail_pattern_path = f"/home/kali/workspace/{EXPLOITATION_DETAIL_PATTERN_RELATIVE_PATH}"
     observation_artifacts_dir = f"/home/kali/workspace/{OBSERVATION_ARTIFACTS_RELATIVE_DIR}"
@@ -644,6 +653,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
     result_final_report_path = f"/home/kali/workspace/{RESULT_FINAL_REPORT_RELATIVE_PATH}"
     result_blocker_report_path = f"/home/kali/workspace/{RESULT_BLOCKER_REPORT_RELATIVE_PATH}"
     observation_merger_path = f"/home/kali/{OBSERVATION_MERGER_RELATIVE_PATH}"
+    subagent_registry_helper_path = f"/home/kali/{SUBAGENT_REGISTRY_HELPER_RELATIVE_PATH}"
     exploitation_index_merger_path = f"/home/kali/{EXPLOITATION_INDEX_MERGER_RELATIVE_PATH}"
     artifact_summarizer_path = f"/home/kali/{ARTIFACT_SUMMARIZER_RELATIVE_PATH}"
     challenge_mcp_enabled = bool(challenge.get("challenge_mcp_enabled"))
@@ -712,10 +722,17 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- 起步只允许 1 个 `observation-subagent`。",
         "- observation 一旦达到可利用 checkpoint，就应先结束当前轮并把主文件交回；不要为了“还能多收集一些背景”而继续独占时间片。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
+        "- 给 subagent 的派单第一行必须写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`。",
+        "- 不要在 subagent 派单里写“你是 main agent”“按照 main agent 状态机调度”等字样；`~/.claude/CLAUDE.md` 的 main-only 调度规则只由你使用。",
         "- 创建 subagent 使用当前环境支持的 `Agent` / `Task`；继续同一条链必须优先 `SendMessage` 给已有 owner，不要机械新开 sibling。",
         "- 如果 `Agent` / `Task` tool_result 已返回 `agentId` 并提示可用 `SendMessage` 继续，把该 agent 视为这条链的默认 owner。",
+        "- 新建一个你预计会复用的 owner 后，尽快补一条极短 `SendMessage`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填给该 owner，让它写入 registry；否则 registry 只能防重复，不能稳定辅助恢复。",
         "- 如果当前环境支持 Agent Teams / resume，owner 暂停时优先恢复原 owner；只有无法继续时才新开 agent。",
         "- `supplemental_observation` 默认优先 `SendMessage` 继续原 observation owner，而不是新开 observation sibling。",
+        f"- `subagent registry` 是 owner 台账：创建或继续 subagent 前先读 `{subagent_registry_path}`；不要只靠临时记忆决定是否新开 sibling。",
+        f"- 新建或继续 subagent 的派单里必须包含 `vector_slug`、目标 stage、status、detail 路径，并要求它用 `{subagent_registry_helper_path}` 在开始和结束时更新 registry。",
+        "- 同一 `vector_slug` / 同一 detail JSON 已有 owner 时，默认用 `SendMessage` 继续；只有 owner 明确不可恢复且继续收益高，才允许新开替代 agent。",
+        "- observation 只允许一个长期 owner；如果 registry 或当前会话里已有 observation owner，默认继续它。",
         "- 给 exploitation 派单时必须写清“只验证到哪一步就停止”；不要让 subagent 自行升级到更深验证。若你需要进一步探索，就用 `SendMessage` 唤醒同一 owner 并给新的窄任务说明。",
         "- `summary.priority_actions` 是候选队列，不是自动派单列表；新开 exploitation 前先做一次轻量四因子判断：证据强度、独立性/链路契合、预期收益、预计成本。",
         "- 默认只并行高收益且低/中成本的前 1-2 个动作；高噪声枚举、大范围 brute force、需要消化大量正文的动作，除非能闭合一条 `ready_for_validation` / `in_progress` 组合链，否则不要占用默认并行位。",
@@ -723,6 +740,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- `targeted_exploitation` 起步优先做一轮广度优先的 initial exploitation wave：先让更多独立高价值向量完成首轮浅验证，再决定谁值得深挖。",
         "- 只要队列里还有尚未做首轮验证的高价值独立向量，就不要急着把并行位长期占给同一条链的深度 follow-up；优先补齐这些首轮 exploitation。",
         "- 只有当高价值独立向量的首轮验证基本完成，或某条链已出现强阳性信号并且再走一步就可能直接拿到 flag / file read / code exec 时，才优先深挖该链。",
+        "- 漏洞测试默认采用 BFS / 渐进式策略：先做 existence check，再做 bridge check，最后才做 exploit / retrieval；目标是尽快排除错误路径、收敛正确路径，而不是一开始就把单个向量挖到最深。",
         "- observation 达到 checkpoint 后的停止表示“本轮暂停并交棒”，不是 observation 生命周期终止；initial exploitation wave 启动后，要主动判断是否应 `SendMessage` 继续 observation owner。",
         "- 如果还存在未展开的独立 surface / atomic hypothesis、exploitation 返回了明确缺失事实、或当前 exploitation 队列未满且 observation 还能低成本补高价值事实，优先继续原 observation owner。",
         "- observation 审查优先看：`recommended_next_step` 与 `hypotheses[*].combines_with`。",
@@ -731,12 +749,16 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- `failed` / `blocked` / `exhausted` 不是终判；若缺少前提、连接条件、触发点或观测证据，把它视为 `attempted_but_incomplete`，优先继续同一 owner。",
         "- main agent 自己不执行 `mcp__sandbox__*`；HTTP、python、shell、terminal 都交给 subagent。",
         "- 非 finalization 阶段不读 `.results/*`；不要读取 `runtime_v2/*` 原始日志或 `.claude/projects/*.jsonl`。",
+        "- 只能围绕 `challenge.json` 里的 entrypoint 及同 host 派单；除非 entrypoint 本身就是 localhost，否则不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标。",
+        "- 容器内 `localhost:8000` 是 sandbox MCP 服务，不是 CTF 目标；如果 entrypoint 不可达，写 blocker / `needs_more_observation`，不要派单去扫描本地端口或 MCP 服务。",
         "- helper 写完报告后不要整份回读；只有确实缺字段时再做按字段提取。",
         *challenge_mcp_lines,
         "",
         "关键路径：",
         f"- challenge: `{input_challenge_path}`",
         f"- observation: `{observation_report_path}`",
+        f"- subagent registry: `{subagent_registry_path}`",
+        f"- subagent registry helper: `{subagent_registry_helper_path}`",
         f"- observation merge helper: `{observation_merger_path}`",
         f"- exploitation master: `{exploitation_master_report_path}`",
         f"- exploitation detail pattern: `{exploitation_detail_pattern_path}`",

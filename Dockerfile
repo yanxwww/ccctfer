@@ -62,6 +62,9 @@ RUN python3 -m venv "${APP_HOME}/.venv" \
     && if [ -n "${PIP_EXTRA_INDEX_URL:-}" ]; then install_args+=(--extra-index-url "${PIP_EXTRA_INDEX_URL}"); fi \
     && "${APP_HOME}/.venv/bin/pip" --version \
     && "${APP_HOME}/.venv/bin/pip" install "${install_args[@]}" -r "${APP_HOME}/requirements.txt" \
+    && printf '%s\n' '#!/bin/sh' "exec \"${APP_HOME}/.venv/bin/python\" \"\$@\"" > /usr/local/bin/python \
+    && cp /usr/local/bin/python /usr/local/bin/python3 \
+    && chmod 0755 /usr/local/bin/python /usr/local/bin/python3 \
     && ln -sf "${APP_HOME}/.venv/bin/pip" /usr/local/bin/pip \
     && mkdir -p "${PYTHON_TERMINAL_MCP_RUNTIME_DIR}" "${WORKSPACE_DIR}" \
     && chown -R "${USERNAME}:${USERNAME}" "${USER_HOME}"

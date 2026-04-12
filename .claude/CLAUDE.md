@@ -35,24 +35,30 @@
 
 - 只调度两类角色：`observation-subagent`、`exploitation-subagent`
 - 给 subagent 的派单必须短，只写：
+  - 第一行固定写：`你是 <role>，不是 main agent；不得创建、唤醒或调度任何 subagent`
   - 目标
   - 已知输入
   - 禁止事项
   - 输出路径
   - 预算
 - 不要把整份系统规则或长篇上下文复制给每个 subagent
+- 不要在 subagent 派单里写“你是 main agent”“按照 main agent 状态机调度”等字样；`CLAUDE.md` 的 main-only 调度规则只给 main agent 使用
 
 ## 复用优先
 
 - 用 `Agent` / `Task` 创建新的 subagent；用 `SendMessage` 继续已有 subagent
+- `reports/subagent_registry.json` 是 owner 台账；创建或继续 subagent 前先看这个台账，不要只靠临时记忆
+- 新建 / 续跑 subagent 的派单必须给出 `vector_slug`、stage、status、detail 路径和停止条件，并要求它用 `python3 /home/kali/.claude/tools/manage_subagent_registry.py` 在开始与结束时更新台账
 - 对同一条链、同一 detail JSON、同一 hypothesis 的后续工作，**优先 `SendMessage` 给已有 owner agent**
 - observation owner 也是可复用 owner；checkpoint 之后默认不要忘记它
+- observation 只允许一个长期 owner；registry 或当前会话里已有 observation owner 时，默认继续它
 - 只有在以下情况才新开 `Agent`：
   - 向量彼此独立
   - 端点 / 目标不同
   - 现有 detail 文件未覆盖
   - 任务可以被一句话清楚限定
 - 如果 `Agent` / `Task` tool_result 返回了 `agentId` 并明确提示可用 `SendMessage` 继续，该 agent 就是这条链的默认 owner
+- 新建一个你预计会复用的 owner 后，尽快给它补一条极短 `SendMessage`，把 `owner_id=<agentId>`、当前 stage、detail 路径回填进 `reports/subagent_registry.json`
 - 如果当前环境支持 Agent Teams / resume，原 owner 可恢复时优先恢复它；不要为了同一条链新开 sibling
 
 ## observation owner 续跑规则
@@ -119,6 +125,33 @@
 - 其它剩余向量明显是低收益或高噪声
 
 这时才允许先深挖当前最强链。
+
+## BFS / 渐进式漏洞测试
+
+漏洞测试默认采用 **BFS（广度优先）+ 渐进式验证**：
+
+- 先用最小代价判断“这个向量是否真的成立”
+- 再判断“它缺哪个前置条件 / 桥接条件”
+- 最后才进入更深的 exploit / flag 获取
+
+默认阶段：
+
+1. **stage 1 — existence check**
+   - 只验证最小成立信号
+   - 例：凭证是否有效、上传是否真的落盘、参数是否真的影响模板加载、文件是否真的可访问
+2. **stage 2 — bridge check**
+   - 只验证从已确认 capability 到下一跳所需的桥接条件
+   - 例：上传文件是否能被 include、认证后是否真的能访问某功能、可控路径是否真的进入 render / read 流程
+3. **stage 3 — exploit / retrieval**
+   - 只有当前两层已足够明确时，才去拿 file read / code exec / flag
+
+主调度目标不是“多试 payload”，而是**尽快排除错误路径、收敛正确路径**。
+如果两个向量都还停留在 stage 1，就优先把它们都做完首轮判断；不要让某一个向量在证据还弱时直接跑到 stage 3。
+
+一旦某条链在更浅层级上已经明显强于其它路径：
+
+- 可以把后续并行位优先让给它的下一跳桥接验证
+- 但仍应避免一次跨越多个阶段，除非已经有足够直接证据表明只差最后一步
 
 禁止派发：
 
@@ -227,18 +260,21 @@
 - 不主动扫描整个工作区
 - 不读取 `runtime_v2/*` 原始日志
 - 不读取 `.claude/projects/*.jsonl`
+- 不要把 `localhost` / `127.0.0.1` / 容器内 `0.0.0.0` 当作题目目标，除非 `challenge.json` 的 entrypoint 明确就是这些地址
+- 容器内 `localhost:8000` 是 sandbox MCP 服务，不是 CTF 目标；目标不可达时写 blocker / `needs_more_observation`，不要转去扫描本地端口或 MCP 服务
 - observation / exploitation 报告变大后，不要反复整份 `Read`
 - 需要字段时，用 `Grep` 或更窄的字段提取
 - 遇到 `bootstrap` / `jquery` / `react` / `vue` / `*.min.js` / `*.min.css` / `chunk` / `bundle` 这类 vendor 资产，或任何超过 4KB 的 HTML/JS/CSS/JSON 正文时，不要把全文带回上下文
 - 这类正文只允许：
   - 落盘到 `.artifacts/*`
-  - 用 `python /home/kali/.claude/tools/summarize_artifact.py --path <artifact> [--status <code>] [--content-type <type>] --keyword <kw>` 生成摘要
+  - 用 `python3 /home/kali/.claude/tools/summarize_artifact.py --path <artifact> [--status <code>] [--content-type <type>] --keyword <kw>` 生成摘要
   - 回传 `path/status/content_type/bytes/sha256/keyword_hits/summary/preview`
 - 如果摘要已显示为 vendor-like 且没有关键词命中，不要再贴正文；只有存在目标关键词时才对 artifact 做定向摘录，且摘录不超过 20 行
 
 ## 报告规则
 
 - `reports/observation_report.json` 是唯一 observation 主文件
+- `reports/subagent_registry.json` 是唯一 subagent owner 台账
 - `reports/exploitation/exploitation_report.json` 是 exploitation 总表
 - `reports/exploitation/exploitation_<slug>.json` 是 detail 报告
 - 不允许多个分支写同一个 detail JSON

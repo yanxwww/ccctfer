@@ -1,3 +1,14 @@
 fastmcp==3.2.3
 mcp==1.27.0
 requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+lxml>=5,<7
+html5lib>=1.1,<2
+requests-toolbelt>=1,<2
+websocket-client>=1.8,<2
+pycryptodome>=3.20,<4
+itsdangerous>=2.2,<3
+Jinja2>=3.1,<4
+jsbeautifier>=1.15,<2
+paramiko>=3.5,<5
+Pillow>=11,<13
