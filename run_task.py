@@ -1061,6 +1061,11 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- subagent 发现冲突或决定性 family 时，只能写 proposal，不能自己冻结、换路或继续扩线。",
         "- challenge 的默认复验者是原 owner；只有 owner 污染、无法恢复或连续两次被证伪时才替换。",
         "- 给 subagent 的派单必须短，并显式写：角色、stage、目标、预算、停止条件、输出路径。",
+        "- 若首次 `mcp__sandbox__*` 调用被拒绝，或首轮 subagent 明确报告“工具权限被拒绝且无真实 evidence/capability”，视为 root blocker：不要再启动新的 observation / exploitation subagent，不要再重试 sandbox。",
+        "- root blocker 下，最多只允许 main 额外调用 1 次 `view_hint`；随后直接停表并向用户报告权限/环境阻塞。",
+        "- 不要让 exploitation-subagent 代替 observation 做基础侦察。",
+        "- 不要读取 helper 源码来猜调用方式；只有 helper 本身出现语法/schema 错误时才允许读源码排障。",
+        "- 不要在拿到 `Agent` 工具返回的真实 `agentId` 前，用猜测的 owner_id 预写 registry。",
         *challenge_mcp_lines,
         "",
         "关键路径：",
@@ -1095,7 +1100,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "1. 先读取 challenge JSON、observation report、exploitation index、subagent registry。",
         "2. 若 proposal queue 有未决项，先裁决 proposal。",
         "3. 启动 1 个 observation owner 做收集式测试。",
-        "4. observation 一旦给出 checkpoint，就进入 exploitation 的 BFS wave。",
+        "4. 只有 observation 给出**真实 checkpoint（含 evidence / capability / decision signal，且不是权限型 root blocker）**时，才进入 exploitation 的 BFS wave。",
         "5. 只有在未决 proposal 为空且独立高价值向量首轮验证基本完成后，才进入 DFS。",
     ]
 
@@ -1313,7 +1318,9 @@ def build_claude_shell_command(*, challenge_mcp_enabled: bool = False, agent_mod
         allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
     else:
         visible_tools = [*base_tools, *platform_tool_names]
-        allowed_tools = [*base_tools, *platform_tool_names]
+        # Hide sandbox tools from the main agent's visible list, but keep them
+        # in the inherited allowlist so spawned subagents can still execute.
+        allowed_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
 
     tools = ",".join(visible_tools)
     allowed_tools_text = " ".join(allowed_tools)

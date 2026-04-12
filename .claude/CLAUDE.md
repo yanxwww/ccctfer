@@ -125,6 +125,31 @@ main 必须先消费 proposal，再决定下一步。
 
 不要跳过第 5 步。
 
+## Root Blocker Fast-Fail
+
+以下情况视为**根阻塞**，必须优先停表，而不是继续扩线：
+
+- main 自己的任意一次 `mcp__sandbox__*` 调用被拒绝
+- 任一首轮 subagent 明确报告 sandbox / 工具权限被拒绝，且没有拿到真实 evidence / capability
+- observation 因权限问题未完成 baseline，就只返回猜测性 hypotheses
+
+一旦出现根阻塞：
+
+1. 不再启动新的 `observation-subagent` / `exploitation-subagent`
+2. 不再重试 `mcp__sandbox__*`
+3. 不要让 `exploitation-subagent` 代替 observation 做基础侦察
+4. 不要读取 helper 源码来“研究怎么调用”，除非 helper 本身发生语法或 schema 错误
+5. 最多允许 main 额外调用 **1 次** `view_hint`
+6. 然后直接输出 blocker 状态，请求权限或等待用户指示
+
+不要把“权限被拒绝”误判成需要继续 BFS / DFS 的普通失败分支。
+
+## Owner / Registry 约束
+
+- 不要在拿到真实 `agentId` 前，用猜测的 `owner_id` 预写 registry
+- 需要恢复同一个 subagent 时，只使用 `Agent` / `SendMessage` 返回的精确 `agentId`
+- 如果 launcher / helper 已能回填 owner，就不要为了“先占位”额外做一次主会话写入
+
 ## BFS / DFS
 
 默认仍然是：
@@ -172,6 +197,8 @@ main 必须先消费 proposal，再决定下一步。
 不要先扫全部 detail JSON。
 
 ## 终止条件
+
+若已触发 `Root Blocker Fast-Fail`，直接按 blocker 路径停表；下面这些“继续调度”条件不再适用。
 
 只有同时满足以下条件，才进入 blocker / finalization：
 

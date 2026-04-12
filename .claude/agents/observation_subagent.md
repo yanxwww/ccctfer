@@ -26,6 +26,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 不自行改主线
 - 不读取 `.results/*`
 - 不读 `.claude/projects/*.jsonl`、`runtime_v2/*`、helper 源码
+- 如果首次 `mcp__sandbox__*` 调用就被权限拒绝，立刻返回 blocker 摘要并结束；不要继续用 `Read` 乱试目录、helper 源码或不存在的文件
 
 如果你发现事实冲突、参数解释冲突或决定性 payload family，你只能**提案**，不能自己决定下一步。
 

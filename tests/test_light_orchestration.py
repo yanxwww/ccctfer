@@ -184,13 +184,36 @@ class LightOrchestrationTests(unittest.TestCase):
             self.assertEqual(index["summary"]["open_proposals"][0]["kind"], "fact_challenge")
             self.assertEqual(index["summary"]["priority_actions"][0]["kind"], "proposal")
 
-    def test_orchestrated_main_has_no_sandbox_tools(self) -> None:
+    def test_orchestrated_hides_sandbox_tools_but_keeps_subagent_access(self) -> None:
         import run_task
 
         command = run_task.build_claude_shell_command(challenge_mcp_enabled=False, agent_mode="orchestrated")
         self.assertIn('--tools "Agent,Task,SendMessage,Read,Grep,Glob"', command)
-        self.assertIn('--allowedTools "Agent Task SendMessage Read Grep Glob"', command)
-        self.assertNotIn("mcp__sandbox__python_exec", command)
+        self.assertIn('--allowedTools "Agent Task SendMessage Read Grep Glob mcp__sandbox__python_exec', command)
+
+    def test_orchestrated_prompt_includes_root_blocker_fast_fail_rules(self) -> None:
+        import run_task
+
+        challenge = {
+            "challenge_title": "demo",
+            "challenge_code": "demo-code",
+            "target_host": "10.0.0.1:8080",
+            "challenge_description": "demo target",
+            "challenge_hint": "",
+            "challenge_entrypoints": ["10.0.0.1:8080"],
+            "challenge_mcp_enabled": True,
+            "challenge_mcp_server": "http://10.0.0.1:8000",
+            "server_host": "http://10.0.0.1:8000",
+        }
+
+        prompt = run_task.build_prompt(challenge, agent_mode="orchestrated")
+        self.assertIn("视为 root blocker", prompt)
+        self.assertIn("不要再启动新的 observation / exploitation subagent", prompt)
+        self.assertIn("最多只允许 main 额外调用 1 次 `view_hint`", prompt)
+        self.assertIn("不要让 exploitation-subagent 代替 observation 做基础侦察", prompt)
+        self.assertIn("不要在拿到 `Agent` 工具返回的真实 `agentId` 前，用猜测的 owner_id 预写 registry", prompt)
+        self.assertIn("真实 checkpoint", prompt)
+        self.assertIn("不是权限型 root blocker", prompt)
 
 
 if __name__ == "__main__":
