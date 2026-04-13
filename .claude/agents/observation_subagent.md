@@ -62,6 +62,8 @@ baseline 和 classifier probes 默认采用 **curl-first**：
 - baseline、方法枚举、参数矩阵、Content-Type、重定向判断优先用 `curl`
 - 默认不跟随重定向；使用 `--max-redirs 0` 捕获原始 `status` / `Location`
 - 如果需要跟随重定向，单独发第二个 follow-up 请求，并把原始响应、`redirect_history`、final URL 分开记录
+- 如果响应包含 `Location`，必须解析其中的 query string，记录 `redirect_query_params` 与 `redirect_param_keys`
+- 如果 `redirect_param_keys` 里出现 `next`、`url`、`file`、`path`、`redirect`、`token` 等高价值键，把它写入 `decision_signals` 或 `recommended_next_step`
 - JSON 用 JSON body；form 用 urlencoded；multipart 用 `curl -F`，不要手写 multipart boundary；XML/text 用 raw body + 对应 Content-Type
 - 如果某个 probe 只能用 Python 表达，也必须写出同等字段的结构化 trace，并显式设置 `allow_redirects=False`
 
@@ -88,6 +90,8 @@ baseline 和 classifier probes 默认采用 **curl-first**：
   "response": {
     "status_code": 302,
     "location": "/next",
+    "redirect_query_params": {},
+    "redirect_param_keys": [],
     "redirect_history": [],
     "final_url": "http://target/path",
     "body_sha256": "...",

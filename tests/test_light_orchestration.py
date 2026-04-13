@@ -359,6 +359,8 @@ class LightOrchestrationTests(unittest.TestCase):
         self.assertIn("curl-first", prompt)
         self.assertIn("--max-redirs 0", prompt)
         self.assertIn("redirect_history", prompt)
+        self.assertIn("redirect_query_params", prompt)
+        self.assertIn("redirect_param_keys", prompt)
         self.assertIn(".artifacts/observation/http_trace_<slug>.jsonl", prompt)
         self.assertIn("不要手写 multipart boundary", prompt)
 
@@ -376,12 +378,16 @@ class LightOrchestrationTests(unittest.TestCase):
             self.assertIn("--max-redirs 0", text)
             self.assertIn("Location", text)
             self.assertIn("redirect_history", text)
+            self.assertIn("redirect_query_params", text)
+            self.assertIn("redirect_param_keys", text)
             self.assertIn(".artifacts/observation/http_trace_<slug>.jsonl", text)
             self.assertIn("不要手写 multipart boundary", text)
 
         self.assertIn("Python `requests`", exploitation_rules)
         self.assertIn("allow_redirects=False", exploitation_rules)
         self.assertIn("response.history", exploitation_rules)
+        self.assertIn("redirect_query_params", exploitation_rules)
+        self.assertIn("redirect_param_keys", exploitation_rules)
         self.assertIn("不要只写自然语言", exploitation_rules)
 
 

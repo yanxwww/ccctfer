@@ -166,9 +166,11 @@ main 不亲自发 HTTP 请求，但必须要求 subagent 产出可复核的 HTTP
 - observation / classifier probes 采用 **curl-first**：baseline、方法枚举、参数矩阵、Content-Type、重定向判断优先用 `curl`
 - 默认不跟随重定向；用 `--max-redirs 0` 捕获原始 `status` / `Location`
 - 如果需要跟随重定向，必须单独做第二次请求，并把原始响应、`redirect_history` 和 final URL 分开记录
+- 如果响应包含 `Location`，必须解析其中的 query string，记录 `redirect_query_params` 与 `redirect_param_keys`
+- `redirect_param_keys` 是参数发现信号；如果它们有高价值语义（如 `next`、`url`、`file`、`path`、`redirect`、`token`），main 可以把它们纳入 BFS frontier
 - 参数编码必须明确：JSON 用 JSON body，form 用 urlencoded，multipart 用 `curl -F` 且不要手写 multipart boundary，XML/text 用 raw body + 对应 Content-Type
 - checkpoint 必须引用 HTTP trace artifact，例如 `.artifacts/observation/http_trace_<slug>.jsonl`
-- trace 至少记录：method、url、params / form / json / files、request headers、allow_redirects、status、Location、redirect_history、final_url、body hash、body preview
+- trace 至少记录：method、url、params / form / json / files、request headers、allow_redirects、status、Location、redirect_query_params、redirect_param_keys、redirect_history、final_url、body hash、body preview
 
 main 调度 BFS 时，证据优先级是：curl-backed HTTP trace > structured report > stdout summary。
 
