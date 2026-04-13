@@ -55,11 +55,13 @@
 - 明显异常响应指纹
 - atomic hypotheses
 - `reports/observation_report.json`
+- 作为持续的 frontier producer：每轮发现 checkpoint 就上报，等待 main 决定是否短续航
 
 不负责：
 
 - 深 payload 家族扩展
 - 顺手追 exploit
+- 自己把 checkpoint 跑成完整 exploitation
 - 自己决定主线
 
 ### exploitation-subagent
@@ -157,17 +159,33 @@ main 必须先消费 proposal，再决定下一步。
 - 需要恢复同一个 subagent 时，只使用 `Agent` / `SendMessage` 返回的精确 `agentId`
 - 如果 launcher / helper 已能回填 owner，就不要为了“先占位”额外做一次主会话写入
 
+## HTTP 证据基准
+
+main 不亲自发 HTTP 请求，但必须要求 subagent 产出可复核的 HTTP trace。
+
+- observation / classifier probes 采用 **curl-first**：baseline、方法枚举、参数矩阵、Content-Type、重定向判断优先用 `curl`
+- 默认不跟随重定向；用 `--max-redirs 0` 捕获原始 `status` / `Location`
+- 如果需要跟随重定向，必须单独做第二次请求，并把原始响应、`redirect_history` 和 final URL 分开记录
+- 参数编码必须明确：JSON 用 JSON body，form 用 urlencoded，multipart 用 `curl -F` 且不要手写 multipart boundary，XML/text 用 raw body + 对应 Content-Type
+- checkpoint 必须引用 HTTP trace artifact，例如 `.artifacts/observation/http_trace_<slug>.jsonl`
+- trace 至少记录：method、url、params / form / json / files、request headers、allow_redirects、status、Location、redirect_history、final_url、body hash、body preview
+
+main 调度 BFS 时，证据优先级是：curl-backed HTTP trace > structured report > stdout summary。
+
 ## BFS / DFS
 
 默认仍然是：
 
-- **BFS 阶段**：让不同独立利用族各自完成首轮浅验证
+- **observation 阶段**：只保留 1 个 observation owner；它发现 checkpoint 就停并上报，main 消费后可用同一个 owner 短续航探索下一批 frontier
+- **BFS 阶段**：main 从 observation 的 `recommended_next_step` / `decision_signals` 生成去重 frontier，让不同独立利用族各自完成首轮浅验证
 - **DFS 阶段**：只把最可行的 1-2 条链继续深入
 
 但以下情况优先级高于 BFS / DFS：
 
 - 未决 challenge
 - 明确的决定性 payload family
+
+如果 checkpoint 已经是 decisive vector（已验证 capability + 明确目标/flag 路径），优先只开该 exploitation owner；失败或阻塞后再开旁支。BFS wave 运行期间，observation 可以继续低成本补充侦察，但若已有 decisive exploitation 在跑，不要扩大面太快；若 exploitation 已 terminal success，不要再唤醒 observation 做 finalization。
 
 ## 派单要求
 
@@ -224,6 +242,8 @@ main 必须先消费 proposal，再决定下一步。
 
 如果这些结构化信号还在，就继续调度，不要草率收尾。
 
+进入 terminal success 后设置全局 latch：不再重复调度、重复提交、重复 final 报告。后续 task-notification 只做状态确认，不要再输出整份最终报告。
+
 ## 成功规则
 
 若 challenge MCP 已启用：
@@ -232,3 +252,5 @@ main 必须先消费 proposal，再决定下一步。
 - `code` 只允许使用 `/home/kali/workspace/.inputs/challenge.json` 中的精确 `challenge_code`
 - `correct=true`，或平台明确表示该 flag 已提交过且该题已拿满 flag 点，才算官方成功
 - 一旦某个 agent 已完整成功，main 只负责停止重复调度，不再继续该题
+
+若 challenge MCP 未启用，不要为了“确认能否提交”唤醒已完成 subagent；本地结果文件和来源明确的 flag 证据足以收尾。

@@ -153,6 +153,51 @@ class LightOrchestrationTests(unittest.TestCase):
             updated = json.loads(registry.read_text(encoding="utf-8"))
             self.assertEqual(updated["exploitation_owners"][0]["owner_id"], "a711ce8d53e97c6bf")
 
+    def test_registry_preserves_exact_observation_owner_when_generic_agent_alias_is_sent_later(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "reports" / "subagent_registry.json"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "observation_owner": {
+                            "owner_id": "a6b517fa6187c077f",
+                            "role": "observation-subagent",
+                            "vector_slug": "observation",
+                            "status": "waiting",
+                        },
+                        "exploitation_owners": [],
+                        "proposal_queue": [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.run_cmd(
+                str(REGISTRY_HELPER),
+                "owner",
+                "upsert",
+                "--registry",
+                str(registry),
+                "--role",
+                "observation-subagent",
+                "--owner-id",
+                "observation-agent",
+                "--vector-slug",
+                "observation",
+                "--stage",
+                "finalization",
+                "--status",
+                "completed",
+            )
+            updated = json.loads(registry.read_text(encoding="utf-8"))
+            self.assertEqual(updated["observation_owner"]["owner_id"], "a6b517fa6187c077f")
+            self.assertEqual(updated["observation_owner"]["status"], "completed")
+
     def test_observation_report_repairs_to_v2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "reports" / "observation_report.json"
@@ -235,6 +280,43 @@ class LightOrchestrationTests(unittest.TestCase):
             self.assertEqual(index["summary"]["open_proposals"][0]["kind"], "fact_challenge")
             self.assertEqual(index["summary"]["priority_actions"][0]["kind"], "proposal")
 
+    def test_exploitation_index_detects_nested_flag_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            detail_dir = Path(tmp) / "reports" / "exploitation"
+            detail_dir.mkdir(parents=True, exist_ok=True)
+            detail = detail_dir / "exploitation_xxe_svg_upload.json"
+            detail.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "vector_slug": "xxe_svg_upload",
+                        "stage": "exploit_or_retrieval",
+                        "status": "success",
+                        "evidence": [
+                            {"type": "file_read", "target": "/app/flag.txt", "content": "flag{real_flag_123456}"}
+                        ],
+                        "decision_signals": ["Flag format matches expected pattern flag{...}"],
+                        "mcp_submission": {
+                            "attempted": False,
+                            "status": "not_required",
+                            "flag": "flag{real_flag_123456}",
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            index_path = detail_dir / "exploitation_report.json"
+
+            self.run_cmd(str(EXPLOITATION_HELPER), "--index", str(index_path), "--detail", str(detail))
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            report = index["reports"][0]
+            self.assertTrue(report["candidate_flag_found"])
+            self.assertEqual(report["candidate_flag_count"], 1)
+            self.assertEqual(index["summary"]["candidate_flag_reports"], 1)
+
     def test_orchestrated_hides_sandbox_tools_but_keeps_subagent_access(self) -> None:
         import run_task
 
@@ -270,6 +352,37 @@ class LightOrchestrationTests(unittest.TestCase):
         self.assertIn("每次 `Agent` / `SendMessage` 派单都必须显式携带完整题目元数据", prompt)
         self.assertIn("不要轮询同一份未变化的 JSON", prompt)
         self.assertIn("不要给同一个 owner 发送互相冲突的控制消息", prompt)
+        self.assertIn("observation 是持续 frontier producer", prompt)
+        self.assertIn("生成去重 frontier", prompt)
+        self.assertIn("terminal success", prompt)
+        self.assertIn("challenge_mcp_enabled=false", prompt)
+        self.assertIn("curl-first", prompt)
+        self.assertIn("--max-redirs 0", prompt)
+        self.assertIn("redirect_history", prompt)
+        self.assertIn(".artifacts/observation/http_trace_<slug>.jsonl", prompt)
+        self.assertIn("不要手写 multipart boundary", prompt)
+
+    def test_http_trace_contract_is_documented_for_subagents(self) -> None:
+        main_rules = (REPO_ROOT / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
+        observation_rules = (REPO_ROOT / ".claude" / "agents" / "observation_subagent.md").read_text(
+            encoding="utf-8"
+        )
+        exploitation_rules = (REPO_ROOT / ".claude" / "agents" / "exploitation-subagent.md").read_text(
+            encoding="utf-8"
+        )
+
+        for text in (main_rules, observation_rules):
+            self.assertIn("curl-first", text)
+            self.assertIn("--max-redirs 0", text)
+            self.assertIn("Location", text)
+            self.assertIn("redirect_history", text)
+            self.assertIn(".artifacts/observation/http_trace_<slug>.jsonl", text)
+            self.assertIn("不要手写 multipart boundary", text)
+
+        self.assertIn("Python `requests`", exploitation_rules)
+        self.assertIn("allow_redirects=False", exploitation_rules)
+        self.assertIn("response.history", exploitation_rules)
+        self.assertIn("不要只写自然语言", exploitation_rules)
 
 
 if __name__ == "__main__":

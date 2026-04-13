@@ -19,7 +19,15 @@ ROLE_ALIASES = {
     "exploitation": "exploitation-subagent",
     "exploitation-subagent": "exploitation-subagent",
 }
-GENERIC_OWNER_IDS = set(ROLE_ALIASES) | set(ROLE_ALIASES.values()) | {"main", "main-agent", "main_agent"}
+GENERIC_OWNER_IDS = set(ROLE_ALIASES) | set(ROLE_ALIASES.values()) | {
+    "main",
+    "main-agent",
+    "main_agent",
+    "observation-agent",
+    "observation_agent",
+    "exploitation-agent",
+    "exploitation_agent",
+}
 OWNER_ID_PLACEHOLDER_MARKERS = (
     "<owner_id",
     "owner_id if provided",

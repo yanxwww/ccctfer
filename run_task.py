@@ -643,9 +643,21 @@ class AgentIdCaptureWatcher:
         self._seen.add(key)
 
 
-def image_exists(image: str) -> bool:
+def inspect_image(image: str) -> tuple[bool, bool, str]:
     result = run_command(["docker", "image", "inspect", image], check=False)
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True, False, ""
+
+    error_text = format_process_error(
+        subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+    )
+    is_missing = "No such image" in error_text or "No such object" in error_text
+    return False, is_missing, error_text
+
+
+def image_exists(image: str) -> bool:
+    exists, _is_missing, _error_text = inspect_image(image)
+    return exists
 
 
 def build_image(image: str, *, docker_platform: str = "") -> None:
@@ -664,14 +676,23 @@ def build_image(image: str, *, docker_platform: str = "") -> None:
 
 
 def ensure_image_exists(image: str, *, docker_platform: str = "") -> None:
-    if image_exists(image):
+    exists, is_missing, error_text = inspect_image(image)
+    if exists:
         return
+    if not is_missing:
+        raise SystemExit(
+            f"Could not inspect Docker image '{image}'. This does not look like a missing image.\n"
+            f"Refusing to rebuild automatically; please check Docker context/daemon/permissions.\n"
+            f"{error_text}"
+        )
     print(f"[!] Docker image '{image}' was not found. Building it now...")
     build_image(image, docker_platform=docker_platform)
-    if not image_exists(image):
+    exists_after_build, _is_missing_after_build, error_after_build = inspect_image(image)
+    if not exists_after_build:
         raise SystemExit(
             f"Docker image '{image}' is still unavailable after build. "
-            f"Try running 'docker build -t {image} {shlex.quote(str(REPO_ROOT))}' manually."
+            f"Try running 'docker build -t {image} {shlex.quote(str(REPO_ROOT))}' manually.\n"
+            f"{error_after_build}"
         )
 
 
@@ -1059,12 +1080,22 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- 起步只允许 1 个 `observation-subagent`。",
         f"- exploitation 默认并发上限 {MAX_PARALLEL_EXPLOITATION}，全程 exploitation 子代理总数上限 {MAX_TOTAL_EXPLOITATION_SUBAGENTS}。",
         "- observation 只做收集式测试：baseline + 最多 3 个 classifier probes；出现 anomaly 就 checkpoint，不顺手追 exploit。",
+        "- observation 是持续 frontier producer：每轮发现 checkpoint 就停并上报；main 消费 checkpoint 后，可在 exploitation BFS wave 运行期间用同一个 observation owner 短续航探索下一批 frontier。",
+        "- checkpoint 必须结构化到足以派单：至少包含 `vector_slug`、capability / decision_signal、evidence refs、confidence、建议的 exploitation 预算或 stop_condition。",
+        "- HTTP observation / classifier probes 采用 curl-first 证据基准：baseline、方法枚举、参数矩阵、Content-Type、重定向判断优先用 `curl`；默认不跟随重定向，用 `--max-redirs 0` 捕获原始 `status` / `Location`，若需要跟随必须单独二次请求并记录 `redirect_history` / final URL。",
+        "- checkpoint 必须引用 HTTP trace artifact（例如 `.artifacts/observation/http_trace_<slug>.jsonl`）：记录 method、url、params/form/json/files、headers、allow_redirects、status、Location、redirect_history、body hash/preview；main 基于 trace 调度 BFS，不只看自然语言摘要。",
+        "- 参数编码必须可复核：JSON 用 JSON body，form 用 urlencoded，multipart 用 `curl -F` 且不要手写 multipart boundary，XML/text 用 raw body + 对应 Content-Type。",
+        "- main 进入 exploitation BFS wave 时，先从 observation 的 `recommended_next_step` / `decision_signals` 生成去重 frontier；独立高价值向量按并发上限并行首轮浅验证。",
+        "- 若 checkpoint 已是 decisive vector（已验证 capability + 明确目标/flag 路径），优先只开该 exploitation owner；失败或阻塞后再开旁支。",
+        "- observation 续航要有 backpressure：若已有 decisive exploitation owner 在跑，只做低成本补充侦察；若 exploitation 已 terminal success，不要再唤醒 observation 做 finalization。",
         "- subagent 发现冲突或决定性 family 时，只能写 proposal，不能自己冻结、换路或继续扩线。",
         "- challenge 的默认复验者是原 owner；只有 owner 污染、无法恢复或连续两次被证伪时才替换。",
         "- 给 subagent 的派单必须短，并显式写：角色、stage、目标、预算、停止条件、输出路径。",
         "- 每次 `Agent` / `SendMessage` 派单都必须显式携带完整题目元数据：`challenge_code`、`challenge_title`、`challenge_description`、`challenge_hint`、`challenge_entrypoints`；即使 subagent 还能自己读 challenge JSON，也不能省略。",
         "- 不要轮询同一份未变化的 JSON；只有在收到新的 task-notification、你刚裁决 proposal、或你预期某个 owner 状态已经变化时，才重读相关文件。",
         "- 不要给同一个 owner 发送互相冲突的控制消息；一旦发出 `stop` / `finalize` / `exit`，除非你明确决定恢复同一 owner 并说明原因，否则不要再发相反指令。",
+        "- `challenge_mcp_enabled=false` 时，不要为了提交 flag 唤醒 subagent；已有来源明确的本地 flag 与结果文件即可收尾。",
+        "- 一旦进入 terminal success，设置全局 latch：停止重复调度、重复提交、重复 final 报告；后续 task-notification 只做状态确认，不再输出整份最终报告。",
         "- 若首次 `mcp__sandbox__*` 调用被拒绝，或首轮 subagent 明确报告“工具权限被拒绝且无真实 evidence/capability”，视为 root blocker：不要再启动新的 observation / exploitation subagent，不要再重试 sandbox。",
         "- root blocker 下，最多只允许 main 额外调用 1 次 `view_hint`；随后直接停表并向用户报告权限/环境阻塞。",
         "- 只有在未决 proposal 已清空、现有 owner 没有高价值 `next_action`、且当前链条确实缺少外部信息时，才算“明确阻塞”并允许 `view_hint`；不要在 exploitation 仍有清晰可执行动作时调用 hint。",
@@ -1105,8 +1136,9 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "1. 先读取 challenge JSON、observation report、exploitation index、subagent registry。",
         "2. 若 proposal queue 有未决项，先裁决 proposal。",
         "3. 启动 1 个 observation owner 做收集式测试。",
-        "4. 只有 observation 给出**真实 checkpoint（含 evidence / capability / decision signal，且不是权限型 root blocker）**时，才进入 exploitation 的 BFS wave。",
-        "5. 只有在未决 proposal 为空且独立高价值向量首轮验证基本完成后，才进入 DFS。",
+        "4. 只有 observation 给出**真实 checkpoint（含 evidence / capability / decision signal，且不是权限型 root blocker）**时，才进入 main 控制的 exploitation BFS wave。",
+        "5. exploitation BFS wave 启动后，可让同一 observation owner 继续短探索下一批 frontier；成功拿到 flag 或 terminal success 时立即停，不再唤醒任何 owner 做收尾确认。",
+        "6. 只有在未决 proposal 为空且独立高价值向量首轮验证基本完成后，才进入 DFS。",
     ]
 
     if challenge_mcp_enabled:

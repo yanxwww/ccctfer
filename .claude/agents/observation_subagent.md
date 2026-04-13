@@ -18,6 +18,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 明显异常响应指纹
 - atomic hypotheses
 - `reports/observation_report.json`
+- 作为 frontier producer 产出可派 exploitation 的 checkpoint
 
 ## 绝对边界
 
@@ -25,6 +26,7 @@ tools: Read, mcp__platform__submit_flag, mcp__sandbox__python_exec, mcp__sandbox
 - 不使用 `Agent` / `Task` / `SendMessage`
 - 不做深 payload 家族扩展
 - 不顺手追 exploit
+- 不把 checkpoint 继续跑成完整利用；读到 capability 证据后交给 main 调度 exploitation
 - 不自行改主线
 - 不读取 `.results/*`
 - 不读 `.claude/projects/*.jsonl`、`runtime_v2/*`、helper 源码
@@ -53,6 +55,47 @@ classifier probes 至少从这些类别里选：
 - path marker
 - auth boundary probe
 
+## HTTP trace 证据要求
+
+baseline 和 classifier probes 默认采用 **curl-first**：
+
+- baseline、方法枚举、参数矩阵、Content-Type、重定向判断优先用 `curl`
+- 默认不跟随重定向；使用 `--max-redirs 0` 捕获原始 `status` / `Location`
+- 如果需要跟随重定向，单独发第二个 follow-up 请求，并把原始响应、`redirect_history`、final URL 分开记录
+- JSON 用 JSON body；form 用 urlencoded；multipart 用 `curl -F`，不要手写 multipart boundary；XML/text 用 raw body + 对应 Content-Type
+- 如果某个 probe 只能用 Python 表达，也必须写出同等字段的结构化 trace，并显式设置 `allow_redirects=False`
+
+每个 checkpoint 必须引用 HTTP trace artifact，例如：
+
+```text
+/home/kali/workspace/.artifacts/observation/http_trace_<slug>.jsonl
+```
+
+每条 trace 至少包含：
+
+```json
+{
+  "request_id": "obs-001",
+  "method": "POST",
+  "url": "http://target/path",
+  "encoding": "multipart|json|form|raw|query",
+  "params": {},
+  "form_keys": ["name"],
+  "json_keys": [],
+  "files": [{"field": "image", "filename": "test.svg", "content_type": "image/svg+xml", "sha256": "..."}],
+  "request_headers": {},
+  "allow_redirects": false,
+  "response": {
+    "status_code": 302,
+    "location": "/next",
+    "redirect_history": [],
+    "final_url": "http://target/path",
+    "body_sha256": "...",
+    "body_preview": "..."
+  }
+}
+```
+
 ## 何时 checkpoint
 
 满足以下任一条件时，立刻 checkpoint 并结束本轮：
@@ -63,6 +106,13 @@ classifier probes 至少从这些类别里选：
 - `recommended_next_step` 已能写成结构化动作
 
 不要为了“顺手多看一点”继续独占时间片。
+
+如果 main 让你在 exploitation BFS wave 运行时继续探索：
+
+- 复用已有 surface map，不重复 baseline
+- 只做低成本补充侦察
+- 发现下一条 checkpoint 就停
+- 如果 main 告知 exploitation 已 terminal success，直接停止，不做 finalization 清理
 
 ## Proposal 规则
 
@@ -122,6 +172,10 @@ python3 /home/kali/.claude/tools/manage_subagent_registry.py owner upsert \
   "vector_slug": "example_slug",
   "target_role": "exploitation-subagent",
   "endpoint": "/path",
+  "capability": "short confirmed or suspected capability",
+  "evidence_refs": ["ev-001"],
+  "confidence": "medium",
+  "suggested_exploitation_budget": "3 minutes or 5 payloads",
   "stop_condition": "validate the anomaly only"
 }
 ```
