@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shutil
 import shlex
 import signal
@@ -375,6 +376,18 @@ def build_instance_slug(runtime_env: dict[str, str]) -> str:
     if len(instance_slug) > 48:
         instance_slug = instance_slug[:48].rstrip("-.") or "runner"
     return instance_slug
+
+
+def build_run_tag(runtime_env: dict[str, str]) -> str:
+    raw_run_tag = (
+        get_runtime_value(runtime_env, "AGENT_RUN_TAG")
+        or get_runtime_value(runtime_env, "RUN_INSTANCE_TAG")
+        or secrets.token_hex(4)
+    )
+    run_tag = slugify_title(raw_run_tag)
+    if len(run_tag) > 16:
+        run_tag = run_tag[:16].rstrip("-.") or secrets.token_hex(4)
+    return run_tag
 
 
 def run_command(
@@ -1733,7 +1746,8 @@ def main() -> int:
         timestamp = datetime.now().strftime("%m%d-%H%M%S")
         title_slug = slugify_title(str(challenge["challenge_title"]))
         instance_slug = build_instance_slug(runtime_env)
-        task_dir = workspace_root / f"{timestamp}-{title_slug}-{instance_slug}"
+        run_tag = build_run_tag(runtime_env)
+        task_dir = workspace_root / f"{timestamp}-{title_slug}-{instance_slug}-{run_tag}"
         task_dir.mkdir(parents=True, exist_ok=False)
         initialize_task_dirs(task_dir)
         write_challenge_snapshot(task_dir, challenge)
@@ -1742,7 +1756,7 @@ def main() -> int:
         ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
         ensure_exploitation_report_index(task_dir)
 
-        container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}-{instance_slug}")
+        container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}-{instance_slug}-{run_tag}")
         try:
             run_command(build_run_command(args, container_name, task_dir, challenge, runtime_env))
         except subprocess.CalledProcessError as error:
