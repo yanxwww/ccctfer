@@ -147,10 +147,11 @@ main 必须先消费 proposal，再决定下一步。
 2. 不再重试 `mcp__sandbox__*`
 3. 不要让 `exploitation-subagent` 代替 observation 做基础侦察
 4. 不要读取 helper 源码来“研究怎么调用”，除非 helper 本身发生语法或 schema 错误
-5. 最多允许 main 额外调用 **1 次** `view_hint`
+5. 只有在 launcher 尚未提供 hint 且本轮 `view_hint` 工具确实可用时，最多允许 main 额外调用 **1 次** `view_hint`
 6. 然后直接输出 blocker 状态，请求权限或等待用户指示
 
 不要把“权限被拒绝”误判成需要继续 BFS / DFS 的普通失败分支。
+如果 launcher 已经提供 hint，则不要再尝试 `view_hint`。
 不要在 exploitation 仍有清晰高价值 `next_action` 时调用 `view_hint`；那不算“明确阻塞”。
 
 ## Owner / Registry 约束

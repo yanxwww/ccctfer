@@ -886,6 +886,10 @@ def load_challenge(runtime_env: dict[str, str], *, enable_challenge_mcp: bool = 
     return challenge
 
 
+def challenge_has_launcher_hint(challenge: dict[str, object]) -> bool:
+    return bool(str(challenge.get("challenge_hint") or "").strip())
+
+
 def write_challenge_snapshot(task_dir: Path, challenge: dict[str, object]) -> None:
     snapshot = task_dir / INPUT_CHALLENGE_RELATIVE_PATH
     snapshot.parent.mkdir(parents=True, exist_ok=True)
@@ -1150,14 +1154,14 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
     exploitation_index_merger_path = f"/home/kali/{EXPLOITATION_INDEX_MERGER_RELATIVE_PATH}"
     artifact_summarizer_path = f"/home/kali/{ARTIFACT_SUMMARIZER_RELATIVE_PATH}"
     challenge_mcp_enabled = bool(challenge.get("challenge_mcp_enabled"))
+    view_hint_enabled = challenge_mcp_enabled and not challenge_has_launcher_hint(challenge)
     challenge_mcp_lines = []
     if challenge_mcp_enabled:
         challenge_mcp_lines.extend(
             [
-                "- challenge MCP 已启用；当前只开放 `submit_flag` 与 `view_hint`。",
+                "- challenge MCP 已启用；至少开放 `submit_flag`。",
                 "- 题目入口点已经由 launcher 提供；不要尝试调用 `list_challenges`、`start_challenge`、`stop_challenge`，也不要把思路转向“先起题再拿入口”。",
                 "- 赛题 code 的唯一可信来源是 `/home/kali/workspace/.inputs/challenge.json` 里的 `challenge_code`（并与环境变量 `CHALLENGE_CODE` 对齐）；禁止从标题、描述、URL、中文文本或任何 slug 变体猜码。",
-                "- `view_hint` 只允许你这个 main agent 在明确阻塞时调用；不要下放给 subagent。",
                 "- 任意 agent 一旦拿到完整、可复核、来源明确的候选 `flag{...}`，都必须立即调用 `mcp__platform__submit_flag`；不要等回到 main agent 再转交。",
                 "- `submit_flag` 返回 `correct=true` 时，它就是官方成功；若 `flag_got_count < flag_count`，它只是部分命中，是否继续由 main agent 决定；只有该题已拿满 flag 点时，当前 run 才立即视为成功。",
                 "- 如果 `submit_flag` 的返回明确表示这个 flag 已经提交过、已获得，或 `already submitted` / `already solved`，把它视为该 flag 已被官方验证成功，而不是答案错误；若该题已拿满 flag 点则立即结束，否则视为部分命中。",
@@ -1167,6 +1171,19 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
                 "- 当前 run 不依赖 hook 自动补交；发现 flag 的那个 agent 自己负责立刻调用 `mcp__platform__submit_flag`。",
             ]
         )
+        if view_hint_enabled:
+            challenge_mcp_lines.extend(
+                [
+                    "- 当前额外开放 `view_hint`。",
+                    "- `view_hint` 只允许你这个 main agent 在明确阻塞时调用；不要下放给 subagent。",
+                ]
+            )
+        else:
+            challenge_mcp_lines.extend(
+                [
+                    "- launcher 已经提供 hint；本轮禁止调用 `view_hint`，也不要把问题归因于“还没看 hint”。",
+                ]
+            )
 
     if agent_mode == "single":
         prompt_lines = [
@@ -1211,6 +1228,21 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         ]
         return "\n".join(prompt_lines)
 
+    root_blocker_lines = []
+    if view_hint_enabled:
+        root_blocker_lines.extend(
+            [
+                "- root blocker 下，最多只允许 main 额外调用 1 次 `view_hint`；随后直接停表并向用户报告权限/环境阻塞。",
+                "- 只有在未决 proposal 已清空、现有 owner 没有高价值 `next_action`、且当前链条确实缺少外部信息时，才算“明确阻塞”并允许 `view_hint`；不要在 exploitation 仍有清晰可执行动作时调用 hint。",
+            ]
+        )
+    else:
+        root_blocker_lines.extend(
+            [
+                "- launcher 已提供 hint；root blocker 下不要再尝试 `view_hint`，直接整理 blocker 报告并停止扩线。",
+            ]
+        )
+
     prompt_lines = [
         "你正在执行一个授权 Web CTF `find_flag` 任务。",
         "先读取 `~/.claude/CLAUDE.md` 并严格执行；这里只补充本轮题目与会话级参数。",
@@ -1243,8 +1275,7 @@ def build_prompt(challenge: dict[str, object], *, agent_mode: str = "orchestrate
         "- `challenge_mcp_enabled=false` 时，不要为了提交 flag 唤醒 subagent；已有来源明确的本地 flag 与结果文件即可收尾。",
         "- 一旦进入 terminal success，设置全局 latch：停止重复调度、重复提交、重复 final 报告；后续 task-notification 只做状态确认，不再输出整份最终报告。",
         "- 若首次 `mcp__sandbox__*` 调用被拒绝，或首轮 subagent 明确报告“工具权限被拒绝且无真实 evidence/capability”，视为 root blocker：不要再启动新的 observation / exploitation subagent，不要再重试 sandbox。",
-        "- root blocker 下，最多只允许 main 额外调用 1 次 `view_hint`；随后直接停表并向用户报告权限/环境阻塞。",
-        "- 只有在未决 proposal 已清空、现有 owner 没有高价值 `next_action`、且当前链条确实缺少外部信息时，才算“明确阻塞”并允许 `view_hint`；不要在 exploitation 仍有清晰可执行动作时调用 hint。",
+        *root_blocker_lines,
         "- 不要让 exploitation-subagent 代替 observation 做基础侦察。",
         "- 不要读取 helper 源码来猜调用方式；只有 helper 本身出现语法/schema 错误时才允许读源码排障。",
         "- 不要在拿到 `Agent` 工具返回的真实 `agentId` 前，用猜测的 owner_id 预写 registry。",
@@ -1486,13 +1517,20 @@ SANDBOX_TOOL_NAMES = (
 )
 
 
-def build_claude_shell_command(*, challenge_mcp_enabled: bool = False, agent_mode: str = "orchestrated") -> str:
+def build_claude_shell_command(
+    *,
+    challenge_mcp_enabled: bool = False,
+    allow_view_hint: bool = False,
+    agent_mode: str = "orchestrated",
+) -> str:
     base_tools = ["Read", "Grep", "Glob"]
     if agent_mode == "orchestrated":
         base_tools = ["Agent", "Task", "SendMessage", *base_tools]
     platform_tool_names: list[str] = []
     if challenge_mcp_enabled:
-        platform_tool_names = ["mcp__platform__submit_flag", "mcp__platform__view_hint"]
+        platform_tool_names = ["mcp__platform__submit_flag"]
+        if allow_view_hint:
+            platform_tool_names.append("mcp__platform__view_hint")
 
     if agent_mode == "single":
         visible_tools = [*base_tools, *SANDBOX_TOOL_NAMES, *platform_tool_names]
@@ -1524,6 +1562,7 @@ def run_claude_task(
     timeout_seconds: int,
     *,
     challenge_mcp_enabled: bool = False,
+    allow_view_hint: bool = False,
     agent_mode: str = "orchestrated",
 ) -> tuple[int, bool]:
     command = [
@@ -1535,7 +1574,11 @@ def run_claude_task(
         container_name,
         "bash",
         "-c",
-        build_claude_shell_command(challenge_mcp_enabled=challenge_mcp_enabled, agent_mode=agent_mode),
+        build_claude_shell_command(
+            challenge_mcp_enabled=challenge_mcp_enabled,
+            allow_view_hint=allow_view_hint,
+            agent_mode=agent_mode,
+        ),
     ]
     watcher = AgentIdCaptureWatcher(task_dir)
     watcher.start()
@@ -1777,6 +1820,7 @@ def main() -> int:
                 prompt,
                 args.timeout_seconds,
                 challenge_mcp_enabled=bool(challenge.get("challenge_mcp_enabled")),
+                allow_view_hint=bool(challenge.get("challenge_mcp_enabled")) and not challenge_has_launcher_hint(challenge),
                 agent_mode=args.agent_mode,
             )
             repaired_observation = ensure_canonical_observation_report(task_dir, archive_noncanonical=True)
