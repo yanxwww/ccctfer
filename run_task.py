@@ -32,6 +32,7 @@ DEFAULT_AGENT_MODE = os.getenv("AGENT_MODE", "orchestrated").strip().lower() or 
 AGENT_TEAMS_ENV_NAME = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 AGENT_TEAMS_ENV_VALUE = "1"
 ENV_FILE_PATH = REPO_ROOT / ".env"
+IMAGE_CACHE_PATH = REPO_ROOT / "workspace" / ".docker_image_cache.json"
 CLAUDE_MCP_CONFIG_NAME = "mcp.json"
 INPUTS_DIR_NAME = ".inputs"
 REPORTS_DIR_NAME = "reports"
@@ -364,6 +365,18 @@ def docker_name(value: str) -> str:
     return safe or "ctf-task"
 
 
+def build_instance_slug(runtime_env: dict[str, str]) -> str:
+    raw_instance_name = (
+        get_runtime_value(runtime_env, "AGENT_INSTANCE_NAME")
+        or get_runtime_value(runtime_env, "ANTHROPIC_MODEL")
+        or f"pid-{os.getpid()}"
+    )
+    instance_slug = slugify_title(raw_instance_name)
+    if len(instance_slug) > 48:
+        instance_slug = instance_slug[:48].rstrip("-.") or "runner"
+    return instance_slug
+
+
 def run_command(
     command: list[str],
     *,
@@ -484,6 +497,38 @@ def extract_agent_id_from_tool_result(tool_use_result: dict[str, object]) -> str
         match = CLAUDE_AGENT_ID_PATTERN.search(str(block.get("text") or ""))
         if match:
             return match.group(1).strip()
+    return ""
+
+
+def extract_sidechain_prompt_text(payload: dict[str, object]) -> str:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                chunks.append(str(item.get("text") or ""))
+        return "\n".join(chunks)
+    return ""
+
+
+def infer_role_from_sidechain_meta(source_path: Path, prompt_text: str) -> str:
+    meta_path = source_path.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    role = str(meta.get("agentType") or "").strip()
+    if role in {"observation-subagent", "exploitation-subagent"}:
+        return role
+    if "observation-subagent" in prompt_text:
+        return "observation-subagent"
+    if "exploitation-subagent" in prompt_text:
+        return "exploitation-subagent"
     return ""
 
 
@@ -622,6 +667,9 @@ class AgentIdCaptureWatcher:
             payload = json.loads(raw_line)
         except json.JSONDecodeError:
             return
+        if payload.get("isSidechain") is True:
+            self._process_sidechain_line(source_path, payload)
+            return
         if payload.get("type") != "user":
             return
         tool_use_result = payload.get("toolUseResult")
@@ -635,6 +683,28 @@ class AgentIdCaptureWatcher:
             return
         prompt_text = str(tool_use_result.get("prompt") or "")
         detail_report = extract_detail_report_from_prompt(prompt_text)
+        key = (str(source_path), role, agent_id, detail_report)
+        if key in self._seen:
+            return
+        if backfill_registry_owner_id(self.task_dir, role=role, agent_id=agent_id, detail_report=detail_report):
+            self._captures += 1
+        self._seen.add(key)
+
+    def _process_sidechain_line(self, source_path: Path, payload: dict[str, object]) -> None:
+        if payload.get("type") != "user":
+            return
+        agent_id = str(payload.get("agentId") or "").strip()
+        if not agent_id:
+            return
+        prompt_text = extract_sidechain_prompt_text(payload)
+        if not prompt_text:
+            return
+        role = infer_role_from_sidechain_meta(source_path, prompt_text)
+        if role not in {"observation-subagent", "exploitation-subagent"}:
+            return
+        detail_report = extract_detail_report_from_prompt(prompt_text)
+        if role == "exploitation-subagent" and not detail_report:
+            return
         key = (str(source_path), role, agent_id, detail_report)
         if key in self._seen:
             return
@@ -660,6 +730,64 @@ def image_exists(image: str) -> bool:
     return exists
 
 
+def inspect_image_id(image: str) -> str:
+    result = run_command(["docker", "image", "inspect", image, "--format", "{{.Id}}"], check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def image_cache_key(image: str) -> str:
+    return image.strip()
+
+
+def load_image_cache() -> dict[str, str]:
+    if not IMAGE_CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(IMAGE_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value) for key, value in payload.items() if isinstance(value, str) and value.strip()}
+
+
+def save_image_cache(payload: dict[str, str]) -> None:
+    IMAGE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = IMAGE_CACHE_PATH.with_name(f".{IMAGE_CACHE_PATH.name}.{os.getpid()}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp_path, IMAGE_CACHE_PATH)
+
+
+def remember_image_id(image: str) -> None:
+    image_id = inspect_image_id(image)
+    if not image_id:
+        return
+    payload = load_image_cache()
+    payload[image_cache_key(image)] = image_id
+    save_image_cache(payload)
+
+
+def restore_cached_image_tag(image: str) -> bool:
+    payload = load_image_cache()
+    cached_image_id = payload.get(image_cache_key(image), "").strip()
+    if not cached_image_id:
+        return False
+    exists, _is_missing, _error_text = inspect_image(cached_image_id)
+    if not exists:
+        return False
+    try:
+        run_command(["docker", "image", "tag", cached_image_id, image])
+    except subprocess.CalledProcessError:
+        return False
+    if not image_exists(image):
+        return False
+    print(f"[+] Restored Docker image tag '{image}' from cached image id {cached_image_id}.")
+    remember_image_id(image)
+    return True
+
+
 def build_image(image: str, *, docker_platform: str = "") -> None:
     command = ["docker", "build", "-t", image]
     if docker_platform:
@@ -678,6 +806,7 @@ def build_image(image: str, *, docker_platform: str = "") -> None:
 def ensure_image_exists(image: str, *, docker_platform: str = "") -> None:
     exists, is_missing, error_text = inspect_image(image)
     if exists:
+        remember_image_id(image)
         return
     if not is_missing:
         raise SystemExit(
@@ -685,6 +814,8 @@ def ensure_image_exists(image: str, *, docker_platform: str = "") -> None:
             f"Refusing to rebuild automatically; please check Docker context/daemon/permissions.\n"
             f"{error_text}"
         )
+    if restore_cached_image_tag(image):
+        return
     print(f"[!] Docker image '{image}' was not found. Building it now...")
     build_image(image, docker_platform=docker_platform)
     exists_after_build, _is_missing_after_build, error_after_build = inspect_image(image)
@@ -694,6 +825,7 @@ def ensure_image_exists(image: str, *, docker_platform: str = "") -> None:
             f"Try running 'docker build -t {image} {shlex.quote(str(REPO_ROOT))}' manually.\n"
             f"{error_after_build}"
         )
+    remember_image_id(image)
 
 
 def load_runtime_env() -> dict[str, str]:
@@ -1600,7 +1732,8 @@ def main() -> int:
 
         timestamp = datetime.now().strftime("%m%d-%H%M%S")
         title_slug = slugify_title(str(challenge["challenge_title"]))
-        task_dir = workspace_root / f"{timestamp}-{title_slug}"
+        instance_slug = build_instance_slug(runtime_env)
+        task_dir = workspace_root / f"{timestamp}-{title_slug}-{instance_slug}"
         task_dir.mkdir(parents=True, exist_ok=False)
         initialize_task_dirs(task_dir)
         write_challenge_snapshot(task_dir, challenge)
@@ -1609,7 +1742,7 @@ def main() -> int:
         ensure_canonical_observation_report(task_dir, archive_noncanonical=False)
         ensure_exploitation_report_index(task_dir)
 
-        container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}")
+        container_name = docker_name(f"ccctfer-{timestamp}-{challenge['challenge_code']}-{instance_slug}")
         try:
             run_command(build_run_command(args, container_name, task_dir, challenge, runtime_env))
         except subprocess.CalledProcessError as error:

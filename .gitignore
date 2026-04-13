@@ -1,2 +1,5 @@
 /workspace
 .env
+tests
+runtime_V2
+__pycache__
