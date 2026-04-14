@@ -36,9 +36,13 @@ allowed-tools: Read
 
 ---
 
-## POC索引（共2条）
+## POC索引（共6条）
 
 格式：`挑战名称 | 关键词 | 漏洞类型 | 文件路径`
 
 - ctf-layer-breach | layer breach ssrf lfi file proxy | SSRF, Local File Inclusion | ctf-layer-breach/SKILL.md
 - ctf-link-violation | link violation upload shell pivot internal | Upload Vulnerability, Internal Network Penetration | ctf-link-violation/SKILL.md
+- ctf-welcome-to-demo1 | demo1 welcome privilege escalation admin is_admin profile | Privilege Escalation | ctf-welcome-to-demo1/SKILL.md
+- ctf-welcome-to-demo2 | demo2 welcome sql injection whitelist job_type | SQL Injection | ctf-welcome-to-demo2/SKILL.md
+- ctf-welcome-to-demo3 | demo3 welcome idor bola graphql medguard prescription | IDOR, GraphQL | ctf-welcome-to-demo3/SKILL.md
+- ctf-welcome-to-demo4 | demo4 welcome privilege escalation admin hash password | Privilege Escalation | ctf-welcome-to-demo4/SKILL.md
